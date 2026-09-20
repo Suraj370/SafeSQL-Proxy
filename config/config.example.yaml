@@ -1,0 +1,83 @@
+# SafeSQL Proxy service config. One file boots the whole daemon (REST /v1 +
+# MCP), domain-neutral: point `model`/`sources` at any deployment's artifacts.
+# ${ENV} is expanded at load, so secrets live in the environment, not here.
+
+model: models/meridian.yaml                # the semantic model to serve
+sources: examples/meridian/sources.yaml    # generic source manifest (optional)
+index_path: ""                             # grounding index sqlite (empty = temp)
+
+warehouse:
+  dsn: "${DI_DSN}"                         # e.g. postgres://user:pass@host:5432/db?sslmode=disable
+  app_role: "di_app"                       # least-priv role for per-user OBO sessions (RLS)
+  max_scan_bytes: 0                        # pre-execution byte ceiling (0 = off)
+  timeout_secs: 30
+  max_rows: 10000
+
+auth:
+  # Omit the whole `oidc` block to run open (dev). When present, every REST and
+  # MCP request must carry a valid bearer token; identity propagates to the
+  # warehouse via RFC 8693 on-behalf-of.
+  oidc:
+    issuer: "${DI_OIDC_ISSUER}"
+    audience: "warehouse"
+    jwks_url: "${DI_OIDC_JWKS_URL}"        # OR public_key_pem for a static key
+    public_key_pem: ""
+
+governance:
+  tenant_budget_bytes: 0                   # per-tenant cumulative scan-byte cap (0 = unlimited)
+
+server:
+  rest_addr: ":41900"
+  mcp_addr: ":41910"
+  otel: true
+
+# --- Several governed databases from one process ---------------------------
+# A semantic model is scoped to one warehouse, so "which model" and "which
+# warehouse" are the same question. Declare as many as you have; the first is
+# the default. Each gets an MCP endpoint at /db/{id} and is selectable over
+# REST with the X-DI-Database header.
+#
+# Engines open lazily: booting costs no connections, and one unreachable
+# warehouse fails only its own requests.
+#
+# databases:
+#   - id: conglomerate
+#     model: models/conglomerate.yaml
+#     dsn: postgres://user:pass@host:5432/conglomerate?sslmode=disable
+#   - id: shop
+#     model: models/shop.yaml
+#     dsn: mysql://user:pass@host:3306/shop
+#   - id: export
+#     model: models/export.yaml
+#     dsn: sqlite:///data/export.db
+#
+# Leave `model:` out and the database is UNMODELLED: no MCP endpoint, no
+# metrics, read-only direct SQL via POST /v1/sql. That is the day-one state —
+# connected, nothing modelled yet, someone still has to look around.
+#
+#   - id: staging
+#     dsn: postgres://user:pass@host:5432/staging
+#
+# On a MODELLED database /v1/sql is refused; set allow_raw_sql to permit it.
+#
+#   - id: shop
+#     model: models/shop.yaml
+#     dsn: mysql://user:pass@host:3306/shop
+#     allow_raw_sql: false
+#
+# --- Runtime registration --------------------------------------------------
+# Set databases_file to let databases be registered over the API
+# (POST /v1/databases) and survive a restart — this is what a product's setup
+# wizard uses. OFF by default: an endpoint that opens a caller-supplied DSN is
+# not something to enable by accident on a networked service.
+#
+# With it set and no databases declared, DI starts with zero of them, which is
+# the honest state of a product before its user has connected anything.
+#
+# databases_file: /var/lib/di/databases.json
+#
+# models_dir: where POST /v1/databases/{id}/model writes generated semantic
+# models. Empty puts them beside databases_file, so "connect a database" and
+# "then govern it" arrive together rather than one working and the other 403-ing.
+#
+# models_dir: /var/lib/di/models

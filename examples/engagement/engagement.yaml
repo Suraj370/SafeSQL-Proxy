@@ -1,0 +1,39 @@
+# One customer delivery. Every command that takes -engagement reads this, so a
+# colleague reproduces the work from what is checked in rather than from
+# whoever remembers the flags.
+#
+#   di survey     # week one: what is actually in there
+#   di eval       # every metric against its control query
+#   di report     # the handover document
+#   di handover   # the runbook and the CI gate
+#   di drift      # run this on a schedule afterwards
+#
+# Paths resolve against this file, not the working directory. Credentials come
+# from the environment; a variable that is not set is reported by name.
+
+customer: Conglomerate Retail
+started: 2026-08-03
+owner: liliang
+
+databases:
+  - id: warehouse
+    dsn: ${CONGLOM_DSN}
+    model: models/warehouse.yaml
+    # recon defaults to models/warehouse.recon.yaml
+
+deliver:
+  report: out/delivery.md
+  roles: [ceo, finance, store_manager]
+
+# What this engagement needed that the platform did not do. Once is a
+# workaround; the third time somebody hand-rolls the same thing is the
+# expensive one, which is what `di delta` counts.
+delta:
+  - kind: missing-feature
+    what: cross-table ratios (shrinkage over revenue, revenue over floor area) are not proposed by the generator
+    workaround: written by hand into models/warehouse.yaml
+    cost: an afternoon
+
+  - kind: data-issue
+    what: every fact table stops at 2025-12-01 — eight months with no new data
+    workaround: none; the customer's IT need to say whether the load stopped or moved
