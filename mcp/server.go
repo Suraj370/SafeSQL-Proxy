@@ -1,0 +1,291 @@
+// Package mcp exposes the platform's foundational tools as a standalone MCP
+// server (official github.com/modelcontextprotocol/go-sdk). Security (M17):
+// per-request identity from the bearer token → governance principal, per-tool
+// scope checks, and per-principal rate limits. query_metric runs through the
+// governance layer, so RBAC/masking/audit apply to the *real caller* — no
+// confused deputy, no shared service account.
+package mcp
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
+	semantic "github.com/liliang-cn/semantic-go"
+
+	"github.com/suraj370/safesqlproxy/agenttools"
+	"github.com/suraj370/safesqlproxy/connectors"
+	"github.com/suraj370/safesqlproxy/engine"
+	"github.com/suraj370/safesqlproxy/governance"
+	"github.com/suraj370/safesqlproxy/ingest"
+)
+
+type srv struct {
+	eng  *engine.Engine
+	opts *Options
+	rl   *rateLimiter
+}
+
+// NewServer builds the MCP server with the four foundational tools, guarded by
+// identity + scope + rate limit. Pass nil opts for local defaults.
+func NewServer(eng *engine.Engine, opts *Options) *mcpsdk.Server {
+	if opts == nil {
+		opts = defaultOptions()
+	}
+	s := &srv{eng: eng, opts: opts, rl: newRateLimiter(opts.RPS, opts.Burst)}
+	server := mcpsdk.NewServer(&mcpsdk.Implementation{
+		Name: "safesqlproxy", Title: "SafeSQL Proxy semantic warehouse", Version: "0.1.0",
+	}, nil)
+
+	mcpsdk.AddTool(server, &mcpsdk.Tool{Name: "list_metrics",
+		Description: "List the metrics available in the semantic model, with descriptions and synonyms. Call this first."},
+		s.listMetrics)
+	mcpsdk.AddTool(server, &mcpsdk.Tool{Name: "get_dimensions",
+		Description: "Return the dimensions a metric can be grouped by WITHOUT a fanout. Use before query_metric."},
+		s.getDimensions)
+	mcpsdk.AddTool(server, &mcpsdk.Tool{Name: "query_metric",
+		Description: "Run a governed semantic query: compute metrics, optionally grouped by dimensions. You name metrics/dimensions; the layer compiles safe SQL. Never write SQL yourself."},
+		s.queryMetric)
+	mcpsdk.AddTool(server, &mcpsdk.Tool{Name: "brief", Description: briefDescription}, s.brief)
+	mcpsdk.AddTool(server, &mcpsdk.Tool{Name: "board", Description: boardDescription}, s.board)
+	mcpsdk.AddTool(server, &mcpsdk.Tool{Name: "ground",
+		Description: "Resolve a natural-language question into a typed semantic query (metrics, group_by, filters, grain) WITHOUT executing it. Use to see how a question maps to the model, then pass the result to query_metric."},
+		s.ground)
+	mcpsdk.AddTool(server, &mcpsdk.Tool{Name: "ingest_csv",
+		Description: "Ingest a CSV into a warehouse table: infer mapping, run key/data checks, land rows."},
+		s.ingestCSV)
+	mcpsdk.AddTool(server, &mcpsdk.Tool{Name: "describe_warehouse",
+		Description: "List the warehouse tables and their column counts."},
+		s.describeWarehouse)
+	mcpsdk.AddTool(server, &mcpsdk.Tool{Name: "health_check",
+		Description: "Detect cross-source data conflicts (orphans, price drift, oversell)."},
+		s.healthCheck)
+	return server
+}
+
+// ToolNames is what NewServer registers.
+//
+// It exists because the stdio banner listed the tools as a hand-written string
+// and went stale the moment a tool was added: the server served `brief` while
+// telling its operator it did not have one. The SDK does not expose a server's
+// tools, so this list is still written by hand — but it is written once, in the
+// package that owns them, and TestTheAdvertisedToolsAreTheServedTools asks a
+// real client session what the server actually has and fails when they differ.
+var ToolNames = []string{
+	"list_metrics", "get_dimensions", "query_metric", "brief", "board", "ground",
+	"ingest_csv", "describe_warehouse", "health_check",
+}
+
+// principal resolves the caller from the request's bearer token, else the default.
+func (s *srv) principal(req *mcpsdk.CallToolRequest) Principal {
+	if req != nil && req.Extra != nil && req.Extra.TokenInfo != nil {
+		return principalFromToken(req.Extra.TokenInfo, s.opts.Default)
+	}
+	return s.opts.Default
+}
+
+// guard resolves identity, checks the required scope and the rate limit.
+func (s *srv) guard(req *mcpsdk.CallToolRequest, scope string) (Principal, *mcpsdk.CallToolResult) {
+	p := s.principal(req)
+	if !p.hasScope(scope) {
+		return p, errResult(fmt.Sprintf("caller %q lacks required scope %q", p.User, scope))
+	}
+	if !s.rl.allow(p.User) {
+		return p, errResult(fmt.Sprintf("rate limit exceeded for %q", p.User))
+	}
+	return p, nil
+}
+
+type listIn struct{}
+
+func (s *srv) listMetrics(_ context.Context, req *mcpsdk.CallToolRequest, _ listIn) (*mcpsdk.CallToolResult, any, error) {
+	if _, deny := s.guard(req, "metrics:read"); deny != nil {
+		return deny, nil, nil
+	}
+	out := agenttools.ListMetrics(s.eng)
+	var lines []string
+	for _, m := range out {
+		lines = append(lines, "- "+m.Name+": "+m.Description)
+	}
+	return textResult(strings.Join(lines, "\n")), out, nil
+}
+
+type dimIn struct {
+	Metric string `json:"metric" jsonschema:"the metric name to get valid grouping dimensions for"`
+}
+
+func (s *srv) getDimensions(_ context.Context, req *mcpsdk.CallToolRequest, in dimIn) (*mcpsdk.CallToolResult, any, error) {
+	if _, deny := s.guard(req, "metrics:read"); deny != nil {
+		return deny, nil, nil
+	}
+	dims, err := agenttools.Dimensions(s.eng, in.Metric)
+	if err != nil {
+		return errResult(err.Error()), nil, nil
+	}
+	return textResult(strings.Join(dims, ", ")), dims, nil
+}
+
+type queryIn struct {
+	Metrics []string `json:"metrics" jsonschema:"metric names to compute"`
+	GroupBy []string `json:"group_by,omitempty" jsonschema:"dimension names to slice by"`
+	Grain   string   `json:"grain,omitempty" jsonschema:"time grain: day|month|quarter|year"`
+	Limit   int      `json:"limit,omitempty" jsonschema:"max rows"`
+}
+
+func (s *srv) queryMetric(ctx context.Context, req *mcpsdk.CallToolRequest, in queryIn) (*mcpsdk.CallToolResult, any, error) {
+	p, deny := s.guard(req, "metrics:read")
+	if deny != nil {
+		return deny, nil, nil
+	}
+	// Identity propagation: the query runs AS the caller — RBAC/masking/audit apply.
+	ans, err := agenttools.Query(ctx, s.eng, governance.DefaultPolicy(),
+		governance.Principal{User: p.User, Role: p.Role},
+		semantic.Query{Metrics: in.Metrics, GroupBy: in.GroupBy, TimeGrain: in.Grain, Limit: in.Limit})
+	if err != nil {
+		return errResult(err.Error()), nil, nil
+	}
+	out := map[string]any{"columns": ans.Columns, "rows": ans.Rows, "sql": ans.SQL}
+	return textResult(renderTable(ans.Columns, ans.Rows)), out, nil
+}
+
+type groundIn struct {
+	Question string `json:"question" jsonschema:"a natural-language analytics question to resolve into a typed semantic query"`
+}
+
+// ground resolves NL → semantic query using the same grounding engine as the
+// REST POST /v1/ground endpoint (retrieval is reused, not reimplemented). It
+// only resolves the query; it does not execute it, so no warehouse read happens.
+func (s *srv) ground(ctx context.Context, req *mcpsdk.CallToolRequest, in groundIn) (*mcpsdk.CallToolResult, any, error) {
+	if _, deny := s.guard(req, "metrics:read"); deny != nil {
+		return deny, nil, nil
+	}
+	if s.opts.Grounder == nil {
+		return errResult("ground is not configured (no grounding engine)"), nil, nil
+	}
+	if strings.TrimSpace(in.Question) == "" {
+		return errResult("question is required"), nil, nil
+	}
+	q, _, clar, err := s.opts.Grounder.Ground(ctx, in.Question)
+	if err != nil && clar == nil {
+		return errResult(err.Error()), nil, nil
+	}
+	if clar != nil {
+		out := map[string]any{"clarify": clar.Question, "candidates": clar.Candidates}
+		return textResult("clarify: " + clar.Question), out, nil
+	}
+	out := map[string]any{
+		"metrics":  q.Metrics,
+		"group_by": q.GroupBy,
+		"where":    q.Where,
+		"grain":    q.TimeGrain,
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "metrics: %s", strings.Join(q.Metrics, ", "))
+	if len(q.GroupBy) > 0 {
+		fmt.Fprintf(&b, "\ngroup_by: %s", strings.Join(q.GroupBy, ", "))
+	}
+	for _, f := range q.Where {
+		fmt.Fprintf(&b, "\nwhere: %s %s %v", f.Dimension, f.Op, f.Values)
+	}
+	if q.TimeGrain != "" {
+		fmt.Fprintf(&b, "\ngrain: %s", q.TimeGrain)
+	}
+	return textResult(b.String()), out, nil
+}
+
+type ingestIn struct {
+	CSVPath  string   `json:"csv_path" jsonschema:"path to the CSV file"`
+	Table    string   `json:"table" jsonschema:"target table name"`
+	Fields   []string `json:"fields,omitempty" jsonschema:"target columns (default: cleaned CSV headers)"`
+	Required []string `json:"required,omitempty" jsonschema:"target columns that must be non-empty"`
+}
+
+func (s *srv) ingestCSV(ctx context.Context, req *mcpsdk.CallToolRequest, in ingestIn) (*mcpsdk.CallToolResult, any, error) {
+	if _, deny := s.guard(req, "data:write"); deny != nil { // destructive → write scope
+		return deny, nil, nil
+	}
+	src := &connectors.CSVSource{Path: in.CSVPath}
+	batch, err := src.Read(ctx)
+	if err != nil {
+		return errResult(err.Error()), nil, nil
+	}
+	plan := ingest.InferMapping(batch.Schema, in.Table, in.Fields)
+	plan.Required = in.Required
+	rep, err := ingest.Run(ctx, s.eng.WH, batch, plan)
+	if err != nil {
+		return errResult(err.Error()), nil, nil
+	}
+	return textResult(fmt.Sprintf("ingested into %q: read=%d landed=%d skipped=%d",
+		rep.Table, rep.RowsRead, rep.RowsLanded, rep.RowsSkipped)), rep, nil
+}
+
+func (s *srv) describeWarehouse(ctx context.Context, req *mcpsdk.CallToolRequest, _ listIn) (*mcpsdk.CallToolResult, any, error) {
+	if _, deny := s.guard(req, "metrics:read"); deny != nil {
+		return deny, nil, nil
+	}
+	tables, err := agenttools.DescribeWarehouse(ctx, s.eng)
+	if err != nil {
+		return errResult(err.Error()), nil, nil
+	}
+	return textResult(strings.Join(tables, "\n")), tables, nil
+}
+
+func (s *srv) healthCheck(ctx context.Context, req *mcpsdk.CallToolRequest, _ listIn) (*mcpsdk.CallToolResult, any, error) {
+	if _, deny := s.guard(req, "metrics:read"); deny != nil {
+		return deny, nil, nil
+	}
+	if s.opts.ChecksPath == "" {
+		return errResult("health_check is not configured (no checks path)"), nil, nil
+	}
+	conflicts, err := agenttools.HealthCheck(ctx, s.eng, s.opts.ChecksPath)
+	if err != nil {
+		return errResult(err.Error()), nil, nil
+	}
+	var lines []string
+	for _, c := range conflicts {
+		lines = append(lines, fmt.Sprintf("%s [%s]: %d", c.Check, c.Severity, c.Conflicts))
+	}
+	return textResult(strings.Join(lines, "\n")), conflicts, nil
+}
+
+func textResult(s string) *mcpsdk.CallToolResult {
+	return &mcpsdk.CallToolResult{Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: s}}}
+}
+func errResult(s string) *mcpsdk.CallToolResult {
+	return &mcpsdk.CallToolResult{IsError: true, Content: []mcpsdk.Content{&mcpsdk.TextContent{Text: s}}}
+}
+func renderTable(cols []string, rows [][]any) string {
+	var b strings.Builder
+	b.WriteString(strings.Join(cols, " | "))
+	b.WriteByte('\n')
+	for _, r := range rows {
+		cells := make([]string, len(r))
+		for i, c := range r {
+			cells[i] = fmt.Sprintf("%v", c)
+		}
+		b.WriteString(strings.Join(cells, " | ") + "\n")
+	}
+	return b.String()
+}
+
+// NewUnavailableServer stands in for a database that could not be opened.
+//
+// The streamable-HTTP handler builds a server per request and has no way to
+// return an error, so the alternative to this is a panic or a silently empty
+// tool list — both of which look, to a caller, like "this database has no
+// metrics". Every tool here fails with the actual reason instead.
+func NewUnavailableServer(cause error) *mcpsdk.Server {
+	server := mcpsdk.NewServer(&mcpsdk.Implementation{
+		Name: "safesqlproxy", Title: "SafeSQL Proxy (unavailable)", Version: "0.1.0",
+	}, nil)
+	fail := func(context.Context, *mcpsdk.CallToolRequest, struct{}) (*mcpsdk.CallToolResult, any, error) {
+		return errResult(cause.Error()), nil, nil
+	}
+	for _, name := range []string{"list_metrics", "get_dimensions", "query_metric"} {
+		mcpsdk.AddTool(server, &mcpsdk.Tool{Name: name,
+			Description: "Unavailable: " + cause.Error()}, fail)
+	}
+	return server
+}
