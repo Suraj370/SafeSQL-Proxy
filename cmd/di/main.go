@@ -1,0 +1,3951 @@
+// Command di drives the SafeSQL Proxy platform.
+//
+//	di query -metrics net_revenue -by store_region
+//	di query -metrics total_revenue,order_count,avg_order_value
+//
+// It compiles a semantic query (semantic-go) to fanout/chasm-safe SQL and runs
+// it against the live warehouse. (NL `ask` lands in the next slice.)
+package main
+
+import (
+	"bufio"
+	"context"
+	"crypto/hmac"
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	iofs "io/fs"
+	"math"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"text/tabwriter"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/auth"
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+	oteltrace "go.opentelemetry.io/otel/trace"
+
+	agentpkg "github.com/liliang-cn/agent-go/v3/pkg/agent"
+	"github.com/liliang-cn/agent-go/v3/pkg/domain"
+	"github.com/liliang-cn/agent-go/v3/pkg/llm"
+	"github.com/liliang-cn/agent-go/v3/pkg/providers"
+	semantic "github.com/liliang-cn/semantic-go"
+	"github.com/spf13/cobra"
+
+	"github.com/suraj370/safesqlproxy/aicli"
+	"github.com/suraj370/safesqlproxy/anchor"
+	"github.com/suraj370/safesqlproxy/config"
+	"github.com/suraj370/safesqlproxy/connectors"
+	"github.com/suraj370/safesqlproxy/convo"
+	"github.com/suraj370/safesqlproxy/copilot"
+	"github.com/suraj370/safesqlproxy/critic"
+	"github.com/suraj370/safesqlproxy/destinations"
+	"github.com/suraj370/safesqlproxy/engagement"
+	"github.com/suraj370/safesqlproxy/engine"
+	"github.com/suraj370/safesqlproxy/flow"
+	"github.com/suraj370/safesqlproxy/governance"
+	"github.com/suraj370/safesqlproxy/grounding"
+	"github.com/suraj370/safesqlproxy/handover"
+	"github.com/suraj370/safesqlproxy/ingest"
+	mcpserver "github.com/suraj370/safesqlproxy/mcp"
+	"github.com/suraj370/safesqlproxy/modelgen"
+	"github.com/suraj370/safesqlproxy/nleval"
+	"github.com/suraj370/safesqlproxy/nodes"
+	"github.com/suraj370/safesqlproxy/obs"
+	"github.com/suraj370/safesqlproxy/reconcile"
+	"github.com/suraj370/safesqlproxy/rollout"
+	"github.com/suraj370/safesqlproxy/runtime"
+	"github.com/suraj370/safesqlproxy/runtime/ui"
+	"github.com/suraj370/safesqlproxy/spiderbench"
+	"github.com/suraj370/safesqlproxy/survey"
+	"github.com/suraj370/safesqlproxy/warehouse"
+	"github.com/suraj370/safesqlproxy/writeback"
+)
+
+const defaultDSN = "postgres://meridian:meridian@localhost:39632/meridian?sslmode=disable"
+
+func main() {
+	if err := rootCmd().Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+// rootCmd builds the Cobra command tree. Each leaf wraps an existing run* handler
+// that still parses its own flags (DisableFlagParsing), so the CLI gains Cobra's
+// grouped help / version / shell completion with zero change to command behavior.
+func rootCmd() *cobra.Command {
+	root := &cobra.Command{
+		Use:   "di",
+		Short: "SafeSQL Proxy — governed semantic layer + MCP gateway for your warehouse",
+		Long: "SafeSQL Proxy makes a data warehouse safe for AI agents: a semantic layer,\n" +
+			"grounded text-to-SQL, governance on every hop, and a governed MCP server.",
+		Version:       "0.1.0",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		// Real OpenTelemetry, opt-in via DI_OTEL=1 (spans are no-ops otherwise).
+		PersistentPreRunE: func(_ *cobra.Command, _ []string) error {
+			if os.Getenv("DI_OTEL") != "" {
+				if _, err := obs.InitOTel("safesqlproxy"); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
+
+	leaf := func(use, group, short string, run func([]string)) *cobra.Command {
+		c := &cobra.Command{
+			Use: use, Short: short, GroupID: group,
+			DisableFlagParsing: true, // each handler parses its own flags
+			Run:                func(_ *cobra.Command, args []string) { run(args) },
+		}
+		return c
+	}
+
+	root.AddGroup(
+		&cobra.Group{ID: "ai", Title: "AI:"},
+		&cobra.Group{ID: "query", Title: "Query & explore:"},
+		&cobra.Group{ID: "model", Title: "Model & onboarding:"},
+		&cobra.Group{ID: "gov", Title: "Governance & security:"},
+		&cobra.Group{ID: "ops", Title: "Service & operations:"},
+		&cobra.Group{ID: "data", Title: "Data movement:"},
+	)
+
+	root.AddCommand(
+		// AI
+		leaf("copilot", "ai", "Autonomous agent: audits + answers + recommends (agent-go)", runCopilot),
+		leaf("agent", "ai", "Run an LLM agent over the MCP tools", runAgent),
+		// query & explore
+		leaf("query", "query", "Run a governed semantic query", runQuery),
+		leaf("ask", "query", "Ask a question in natural language", runAsk),
+		leaf("brief", "query", "One question, both halves: the figure, who approved its definition, and what was written about it", runBrief),
+		leaf("corpus", "query", "The document half: add what was written down, search it", runCorpus),
+		leaf("status", "ops", "What is wired at this customer and what is not", runStatus),
+		leaf("board", "query", "A BI dashboard as an AIGUI fence: the model proposes the layout, this writes every number", runBoard),
+		leaf("graph", "query", "The explainable half: project the signed model into a graph, then ask what a number rests on or what a column change would move", runGraph),
+		leaf("chat", "query", "Conversational BI with cross-turn memory", runChat),
+		leaf("chain", "query", "Multi-metric chained query", runChain),
+		leaf("explain", "query", "Compile a query to SQL for a dialect (no execution)", runExplain),
+		// model & onboarding
+		leaf("model", "model", "Generate (gen) or lint a semantic model", runModel),
+		leaf("exemplar", "model", "Manage the few-shot exemplar bank", runExemplar),
+		leaf("eval", "model", "Reconciliation gate (metrics vs control SQL)", runEval),
+		leaf("nleval", "model", "NL accuracy gate over the labeled set", runNLEval),
+		leaf("survey", "model", "Site survey: what is actually in a customer's database", runSurvey),
+		leaf("report", "model", "Delivery report: what was modelled and what proves it", runReport),
+		leaf("package", "model", "Pack the engagement into a signed, reproducible handover archive", runPackage),
+		leaf("questions", "model", "Mine the audit trail for the questions people actually asked", runQuestions),
+		leaf("anchor", "model", "Find which scope of a metric reproduces a figure the customer publishes", runAnchor),
+		leaf("handover", "model", "Day 2: runbook + CI gate for the customer's team", runHandover),
+		leaf("drift", "model", "Has anything changed underneath the model?", runDrift),
+		leaf("adoption", "model", "Who is using this, and what nobody ever asks for", runAdoption),
+		leaf("delta", "model", "What the product could not do, across engagements", runDelta),
+		leaf("bench", "model", "Public benchmark (Spider): coverage + correctness", runBench),
+		leaf("shadow", "model", "Diff a query across two model versions", runShadow),
+		leaf("rollout", "model", "Version registry, canary, auto-rollback", runRollout),
+		leaf("intake", "gov", "Sign off on reading a customer database before anything reads it", runIntake),
+		leaf("reported", "model", "Freeze what was sent; later, say why today's number differs", runReported),
+		// governance & security
+		leaf("threats", "gov", "Threat-model-as-code gate", runThreats),
+		leaf("pentest", "gov", "MCP security regression (forged-token battery)", runPentest),
+		leaf("token", "gov", "Dev token issuer (gen-key / mint)", runToken),
+		leaf("obo", "gov", "On-behalf-of identity propagation demo", runOBO),
+		leaf("spend", "gov", "Per-tenant spend ledger", runSpend),
+		leaf("reconcile", "gov", "Detect cross-source data conflicts (AI triage)", runReconcile),
+		leaf("trace", "gov", "OpenTelemetry trace-propagation demo", runTrace),
+		// service & operations
+		leaf("serve", "ops", "Run the service daemon (REST /v1 + MCP + /ui)", runServe),
+		leaf("mcp", "ops", "Run the MCP server (stdio or HTTP)", runMCP),
+		leaf("dashboard", "ops", "Print the execution dashboard", runDashboard),
+		leaf("flow", "ops", "Run a config-driven DataFlow saga", runFlow),
+		leaf("node", "ops", "Run a single pipeline node", runNode),
+		// data movement & write-back
+		leaf("ingest", "data", "Ingest a CSV into the warehouse", runIngest),
+		leaf("source", "data", "Read/ingest from a configured source", runSource),
+		leaf("crm", "data", "Sync from a CRM source", runCRM),
+		leaf("webhook", "data", "Run the webhook receiver", runWebhook),
+		leaf("cdc", "data", "Watch a table for changes (CDC)", runCDC),
+		leaf("sync", "data", "Incrementally sync a live source table into the warehouse (watermark CDC)", runSync),
+		leaf("webhook-ingest", "data", "Receive order webhooks (push) and land them into the governed warehouse", runWebhookIngest),
+		leaf("ingest-status", "data", "Serve a JSON ingestion-status endpoint (warehouse totals, per-source, watermarks)", runIngestStatus),
+		leaf("propose", "data", "Propose a typed write-back change", runPropose),
+		leaf("proposals", "data", "List write-back proposals", runProposals),
+		leaf("approve", "data", "Approve a write-back proposal", func(a []string) { runWriteDecision("approve", a) }),
+		leaf("reject", "data", "Reject a write-back proposal", func(a []string) { runWriteDecision("reject", a) }),
+		leaf("revert", "data", "Revert a committed write-back", func(a []string) { runWriteDecision("revert", a) }),
+	)
+	return root
+}
+
+// runServe starts the control-plane HTTP API (execution dashboard + query +
+// explorer + lineage).
+// runServe is the production core-service daemon: one config boots the shared
+// engine/grounding/governance core and serves it over two contracts — the
+// versioned REST /v1 API and the MCP server — with OIDC identity propagation,
+// OpenTelemetry, health/readiness, and graceful shutdown.
+func runServe(argv []string) {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	cfgPath := fs.String("config", envOr("DI_CONFIG", "config.yaml"), "service config YAML")
+	model := fs.String("model", "models/meridian.yaml", "semantic model (used only if no config file)")
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN (used only if no config file)")
+	_ = fs.Parse(argv)
+
+	// A coding-agent CLI is for the engineer's own commands, never for the
+	// service. Refusing loudly beats ignoring the variable: an operator who set
+	// it expects it to be in use, and a service that silently answered from a
+	// different model than the one they configured is the worst version of
+	// this.
+	if name := os.Getenv("DI_AGENT_CLI"); name != "" {
+		fail(fmt.Errorf("DI_AGENT_CLI=%s is set, and `di serve` will not use it.\n"+
+			"  A CLI agent spawns a process per question (seconds, not milliseconds, and one\n"+
+			"  process per concurrent user), and a personal Claude Code or Codex subscription\n"+
+			"  is not a licence to be the inference backend of software somebody bought — the\n"+
+			"  product would stop working the day that subscription lapses.\n"+
+			"  Use LLM_BASE_URL/LLM_API_KEY/LLM_MODEL here; point them at the customer's own\n"+
+			"  endpoint or a model inside their network. Unset DI_AGENT_CLI to start.", name))
+	}
+
+	// Config-driven when the file exists; otherwise synthesize from flags/env so
+	// `di serve` still works out of the box.
+	var cfg *config.Config
+	if _, statErr := os.Stat(*cfgPath); statErr == nil {
+		c, err := config.Load(*cfgPath)
+		if err != nil {
+			fail(err)
+		}
+		cfg = c
+		fmt.Fprintf(os.Stderr, "-- loaded config %s\n", *cfgPath)
+	} else {
+		cfg = &config.Config{
+			Model: *model, Sources: envOr("DI_SOURCES", "examples/meridian/sources.yaml"),
+			Warehouse:  config.Warehouse{DSN: *dsn, AppRole: os.Getenv("DI_DB_APP_ROLE"), MaxScanBytes: envBytes("DI_MAX_SCAN_BYTES")},
+			Governance: config.Governance{TenantBudgetBytes: envBytes("DI_TENANT_BUDGET_BYTES")},
+			Server:     config.Server{RESTAddr: envOr("DI_ADDR", ":41900"), MCPAddr: envOr("DI_MCP_ADDR", ":41910"), OTel: os.Getenv("DI_OTEL") != ""},
+		}
+		cfg.Server.RESTAddr = orDefaultStr(cfg.Server.RESTAddr, ":41900")
+		cfg.Server.MCPAddr = orDefaultStr(cfg.Server.MCPAddr, ":41910")
+		fmt.Fprintf(os.Stderr, "-- no config file at %s; using flags/env defaults\n", *cfgPath)
+	}
+
+	if cfg.Server.OTel {
+		if _, err := obs.InitOTel("safesqlproxy"); err != nil {
+			fail(err)
+		}
+	}
+
+	// Warehouse options travel via env that engine.New reads.
+	if cfg.Warehouse.AppRole != "" {
+		_ = os.Setenv("DI_DB_APP_ROLE", cfg.Warehouse.AppRole)
+	}
+	if cfg.Warehouse.MaxScanBytes > 0 {
+		_ = os.Setenv("DI_MAX_SCAN_BYTES", fmt.Sprintf("%d", cfg.Warehouse.MaxScanBytes))
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	defs := make([]engine.Def, 0, len(cfg.Defs()))
+	for _, d := range cfg.Defs() {
+		defs = append(defs, engine.Def{ID: d.ID, Model: d.Model, DSN: d.DSN, AllowRawSQL: d.AllowRawSQL})
+	}
+	reg, err := engine.NewRegistry(defs...)
+	if err != nil {
+		fail(err)
+	}
+
+	idx := cfg.IndexPath
+	if idx == "" {
+		dir, derr := os.MkdirTemp("", "di-serve-")
+		if derr != nil {
+			fail(derr)
+		}
+		defer os.RemoveAll(dir)
+		idx = dir
+	}
+	dbs := engine.NewDatabases(reg, idx, "models/exemplars.yaml")
+	if cfg.DatabasesFile != "" {
+		if dbs, err = dbs.WithStore(engine.NewStore(cfg.DatabasesFile)); err != nil {
+			fail(err)
+		}
+		modelsDir := cfg.ModelsDir
+		if modelsDir == "" {
+			modelsDir = filepath.Join(filepath.Dir(cfg.DatabasesFile), "models")
+		}
+		dbs = dbs.WithModelsDir(modelsDir)
+	}
+	defer dbs.Close()
+
+	// Open the default database now so a bad DSN or missing model fails at boot
+	// rather than on the first question. The rest stay closed until asked for:
+	// one unreachable warehouse should not keep the other twelve offline.
+	var eng *engine.Engine
+	if reg.Default() != "" {
+		if eng, err = reg.Get(ctx, reg.Default()); err != nil {
+			fail(err)
+		}
+	}
+
+	pol := governance.DefaultPolicy()
+	pol.TenantBudgetBytes = cfg.Governance.TenantBudgetBytes
+	verifier, authNote := verifierFromConfig(cfg)
+
+	// Workflows and the operator console run against the default database.
+	// They are engineer-facing surfaces with one connection each; making them
+	// multi-database is a console change, not a wiring one. With no database
+	// configured yet they are simply not mounted — the /v1 API is still up, so
+	// a product can register the first one.
+	var fe *flow.Engine
+	if defs := cfg.Defs(); len(defs) > 0 {
+		fe, _ = newFlowEngine(ctx, defs[0].DSN)
+	}
+
+	// One parent mux: stable /v1 data-plane API + the existing control-plane API
+	// + the embedded web console at /ui.
+	v1 := &runtime.V1{DBs: dbs, Pol: pol, Verify: verifier, Engagement: cfg.Engagement}
+	mux := http.NewServeMux()
+	mux.Handle("/v1/", v1.Handler())
+	if eng == nil {
+		fmt.Fprintf(os.Stderr, "-- no database configured yet; the console and control-plane API are not mounted (register one: POST /v1/databases)\n")
+	} else if console, uerr := ui.New(eng, pol, fe); uerr == nil {
+		console.Mount(mux)
+		mux.Handle("/", runtime.NewServer(eng, fe))
+	} else {
+		fmt.Fprintf(os.Stderr, "-- web console disabled: %v\n", uerr)
+		mux.Handle("/", runtime.NewServer(eng, fe))
+	}
+
+	rest := &http.Server{Addr: cfg.Server.RESTAddr, Handler: mux}
+	mcpSrv := buildMCPHTTPServer(cfg.Server.MCPAddr, dbs, verifier)
+
+	errc := make(chan error, 2)
+	go func() { errc <- serveNamed("REST /v1", rest) }()
+	go func() { errc <- serveNamed("MCP", mcpSrv) }()
+	fmt.Fprintf(os.Stderr, "SafeSQL Proxy service up:\n  Console  → %s/ui\n  REST /v1 → %s  (GET /v1/metrics /v1/metrics/{m}/dimensions ; POST /v1/query /v1/ground /v1/ask ; /v1/healthz /v1/readyz)\n  MCP      → %s  (%s)\n  auth: %s · otel: %v\n",
+		cfg.Server.RESTAddr, cfg.Server.RESTAddr, cfg.Server.MCPAddr, strings.Join(mcpserver.ToolNames, "/"), authNote, cfg.Server.OTel)
+	ids := reg.IDs()
+	fmt.Fprintf(os.Stderr, "  databases (%d, default %q):\n", len(ids), reg.Default())
+	for _, id := range ids {
+		d, _ := reg.Def(id)
+		if d.Model == "" {
+			fmt.Fprintf(os.Stderr, "    %-20s unmodelled — direct SQL only (POST /v1/sql, X-DI-Database: %s)\n", id, id)
+			continue
+		}
+		raw := ""
+		if d.AllowRawSQL {
+			raw = "  + raw sql"
+		}
+		fmt.Fprintf(os.Stderr, "    %-20s MCP %s%s   REST  X-DI-Database: %s%s\n",
+			id, cfg.Server.MCPAddr, engine.MountPath(id), id, raw)
+	}
+
+	select {
+	case <-ctx.Done():
+		fmt.Fprintln(os.Stderr, "\n-- shutting down gracefully…")
+	case err := <-errc:
+		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
+	}
+	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = rest.Shutdown(sctx)
+	_ = mcpSrv.Shutdown(sctx)
+}
+
+func serveNamed(name string, s *http.Server) error {
+	if err := s.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	return nil
+}
+
+// buildMCPHTTPServer wires the MCP server over streamable HTTP behind bearer auth
+// (or open when verifier is nil) and continues inbound W3C traces.
+// buildMCPHTTPServer serves every configured database from one listener:
+// / is the default, /db/{id} is that database. The endpoint a client connects
+// to decides which data it sees, so database selection sits with the product
+// that owns the connection and is not reachable as a tool argument the model
+// could set — a model must not be able to wander between a company's databases
+// mid-conversation.
+func buildMCPHTTPServer(addr string, dbs *engine.Databases, verifier auth.TokenVerifier) *http.Server {
+	checks := envOr("DI_CHECKS", "examples/meridian/conflicts.yaml")
+	handler := mcpsdk.NewStreamableHTTPHandler(func(r *http.Request) *mcpsdk.Server {
+		id := engine.DatabaseFromRequest(r)
+		eng, gr, err := dbs.Resolve(r.Context(), id)
+		if err != nil {
+			// The SDK has nowhere to report a factory error, so serve a server
+			// whose every tool says which database was asked for and failed.
+			return mcpserver.NewUnavailableServer(err)
+		}
+		// An unmodelled database has no metrics, so it gets no governed tools.
+		// Exposing empty ones would read, to an agent, as "this business has no
+		// revenue" rather than "nobody has modelled this yet".
+		if !eng.Governed() {
+			return mcpserver.NewUnavailableServer(fmt.Errorf(
+				"database %q has no semantic model — it is available for direct SQL only (POST /v1/sql)",
+				orDefaultStr(id, dbs.Default())))
+		}
+		store, reg, _ := briefParts(eng)
+		opts := &mcpserver.Options{
+			Default:    mcpserver.Principal{User: "local", Role: "analyst", Scopes: []string{"metrics:read", "data:write"}},
+			Burst:      5,
+			ChecksPath: checks,
+			Grounder:   gr,
+			Corpus:     store,
+			Registry:   reg,
+		}
+		return mcpserver.NewServer(eng, opts)
+	}, nil)
+	var h http.Handler = handler
+	if verifier != nil {
+		h = auth.RequireBearerToken(verifier, &auth.RequireBearerTokenOptions{Scopes: []string{"metrics:read"}})(handler)
+	}
+	traced := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.ServeHTTP(w, r.WithContext(obs.ExtractHTTP(r.Context(), r.Header)))
+	})
+	return &http.Server{Addr: addr, Handler: traced}
+}
+
+// verifierFromConfig builds the OIDC verifier from config; nil (open) when no
+// auth block is present.
+func verifierFromConfig(cfg *config.Config) (auth.TokenVerifier, string) {
+	if cfg.Auth.OIDC == nil {
+		return nil, "open (no auth — dev only; set auth.oidc to require tokens)"
+	}
+	o := cfg.Auth.OIDC
+	oc := mcpserver.OIDCConfig{Issuer: o.Issuer, Audience: o.Audience, JWKSURL: o.JWKSURL}
+	if o.PublicKeyPEM != "" {
+		oc.PublicKeyPEM = []byte(o.PublicKeyPEM)
+	}
+	v, err := mcpserver.NewOIDC(oc)
+	if err != nil {
+		fail(err)
+	}
+	src := o.JWKSURL
+	if src == "" {
+		src = "static-key"
+	}
+	return v.Verifier(), fmt.Sprintf("OIDC iss=%q aud=%q keys=%s", o.Issuer, o.Audience, src)
+}
+
+func orDefaultStr(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
+}
+
+// runExplain compiles a semantic query to SQL for a chosen warehouse dialect
+// WITHOUT executing it (M6): the same intent → Postgres / MySQL / Snowflake /
+// Databricks SQL, proving the dialect abstraction. No warehouse connection needed.
+func runExplain(argv []string) {
+	fs := flag.NewFlagSet("explain", flag.ExitOnError)
+	model := fs.String("model", "models/meridian.yaml", "semantic model YAML")
+	dialect := fs.String("dialect", "postgres", "postgres | mysql | sqlite | sqlserver | snowflake | databricks | duckdb | ansi")
+	metrics := fs.String("metrics", "", "comma-separated metrics (required)")
+	by := fs.String("by", "", "group-by dimensions")
+	grain := fs.String("grain", "", "time grain (day|month|quarter|year)")
+	_ = fs.Parse(argv)
+	if *metrics == "" {
+		fail(fmt.Errorf("explain: -metrics is required"))
+	}
+	d, ok := semantic.DialectByName(*dialect)
+	if !ok {
+		fail(fmt.Errorf("unknown dialect %q (postgres|mysql|sqlite|sqlserver|snowflake|databricks|duckdb|ansi)", *dialect))
+	}
+	m, err := semantic.LoadFile(*model)
+	if err != nil {
+		fail(err)
+	}
+	c, err := semantic.Compile(m, semantic.Query{Metrics: split(*metrics), GroupBy: split(*by), TimeGrain: *grain}, d)
+	if err != nil {
+		fail(err)
+	}
+	fmt.Printf("-- dialect: %s\n%s\n", d.Name(), c.SQL)
+	if len(c.Args) > 0 {
+		fmt.Printf("-- args: %v\n", c.Args)
+	}
+}
+
+// runModel is the metadata gate (M4): `di model lint` enforces that every
+// metric describes itself and declares how it rolls up. Exits 1 on any error so
+// it can guard a merge in CI. The rules live in the neutral core (semantic.Lint).
+// runBench dispatches the public-benchmark harness. Spider is the first backend;
+// it reports coverage (how many questions are expressible as a semantic query)
+// alongside correctness on that slice — never a single misleading leaderboard number.
+func runBench(argv []string) {
+	if len(argv) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: di bench spider [-data DIR]")
+		os.Exit(2)
+	}
+	switch argv[0] {
+	case "spider":
+		runBenchSpider(argv[1:])
+	default:
+		fmt.Fprintln(os.Stderr, "usage: di bench spider [-data DIR]")
+		os.Exit(2)
+	}
+}
+
+// runBenchSpider is M1: classify the Spider dev set by expressibility and print
+// coverage. Needs only dev.json — no warehouse, no LLM.
+func runBenchSpider(argv []string) {
+	fs := flag.NewFlagSet("bench spider", flag.ExitOnError)
+	dir := fs.String("data", envOr("DI_SPIDER_DIR", "testdata/spider"), "Spider data dir (holds dev.json)")
+	_ = fs.Parse(argv)
+
+	xs, err := spiderbench.LoadDev(*dir)
+	if err != nil {
+		fail(err)
+	}
+	spiderbench.Cover(xs).Print(os.Stdout)
+}
+
+func runModel(argv []string) {
+	if len(argv) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: di model <lint|gen> [flags]")
+		os.Exit(2)
+	}
+	switch argv[0] {
+	case "lint":
+		runModelLint(argv[1:])
+	case "gen":
+		runModelGen(argv[1:])
+	default:
+		fmt.Fprintln(os.Stderr, "usage: di model <lint|gen> [flags]")
+		os.Exit(2)
+	}
+}
+
+func runModelLint(argv []string) {
+	fs := flag.NewFlagSet("model lint", flag.ExitOnError)
+	model := fs.String("model", "models/meridian.yaml", "semantic model YAML")
+	_ = fs.Parse(argv)
+
+	m, err := semantic.LoadFile(*model)
+	if err != nil {
+		fail(err)
+	}
+	issues := semantic.Lint(m)
+	errs := 0
+	for _, i := range issues {
+		fmt.Println(i)
+		if i.Severity == "error" {
+			errs++
+		}
+	}
+	fmt.Fprintf(os.Stderr, "-- lint %s: %d issue(s), %d error(s)\n", *model, len(issues), errs)
+	if errs > 0 {
+		os.Exit(1)
+	}
+}
+
+// runModelGen is self-serve onboarding: introspect a warehouse and emit a
+// semantic-model draft (heuristic, optionally LLM-refined) for a human to review.
+//
+//	di model gen -dsn ... -out draft.yaml          # heuristic
+//	LLM_BASE_URL/LLM_API_KEY/LLM_MODEL set → adds AI-refined descriptions/metrics
+func runModelGen(argv []string) {
+	fs := flag.NewFlagSet("model gen", flag.ExitOnError)
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN to introspect")
+	out := fs.String("out", "", "write the draft YAML here (default: stdout)")
+	useLLM := fs.Bool("llm", true, "refine with the LLM when LLM_* env is set")
+	_ = fs.Parse(argv)
+
+	ctx := context.Background()
+	wh, err := warehouse.Open(ctx, *dsn, warehouse.Options{})
+	if err != nil {
+		fail(err)
+	}
+	defer wh.Close()
+
+	// Introspection counts rows and takes the extremes of every integer
+	// column, and -llm sends every column name to a model. Both are reads of
+	// the customer's data, so both wait for a signature.
+	plan := requireIntake(ctx, wh, *dsn)
+	fmt.Fprintf(os.Stderr, "-- intake plan %s, signed by %s\n", plan.Short(), plan.SignedBy)
+
+	schema, err := modelgen.Introspect(ctx, wh)
+	if err != nil {
+		fail(err)
+	}
+	if w := withholdRedacted(schema, plan); len(w) > 0 {
+		fmt.Fprintf(os.Stderr, "-- withheld %d redacted column(s): %s\n", len(w), strings.Join(w, ", "))
+	}
+	fmt.Fprintf(os.Stderr, "-- introspected %d table(s)\n", len(schema.Tables))
+
+	var ask modelgen.AskFunc
+	mode := "heuristic"
+	if *useLLM {
+		if a, name, ok := engineerLLM(); ok {
+			ask = modelgen.AskFunc(a)
+			mode = "heuristic + " + name
+		}
+	}
+	model, issues, err := modelgen.Generate(ctx, schema, ask)
+	if err != nil {
+		fail(err)
+	}
+	maskPlanned(model, plan)
+	yamlOut, err := modelgen.ToYAML(model)
+	if err != nil {
+		fail(err)
+	}
+	if *out == "" {
+		fmt.Print(string(yamlOut))
+	} else {
+		if err := os.WriteFile(*out, yamlOut, 0o644); err != nil {
+			fail(err)
+		}
+		fmt.Fprintf(os.Stderr, "-- wrote %s\n", *out)
+	}
+	fmt.Fprintf(os.Stderr, "-- mode: %s · %d entities, %d joins, %d dimensions, %d metrics · %d lint note(s)\n",
+		mode, len(model.Entities), len(model.Joins), len(model.Dimensions), len(model.Metrics), len(issues))
+	fmt.Fprintln(os.Stderr, "-- review the draft, then run: di model lint -model <file>  and  di eval")
+}
+
+// runCopilot is a real agent-go agent driving the whole platform: given a goal,
+// the LLM autonomously calls governed platform tools (describe the warehouse,
+// list metrics, check dimensions, run a governed query, health-check for
+// cross-source conflicts) and synthesizes an answer + a recommended governed fix.
+// The agent decides WHAT to call; the deterministic tools guarantee each result.
+func runCopilot(argv []string) {
+	fs := flag.NewFlagSet("copilot", flag.ExitOnError)
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	model := fs.String("model", "models/meridian.yaml", "semantic model YAML")
+	goal := fs.String("goal", "Describe this warehouse, run a health check for cross-source conflicts, answer: which store region has the highest net revenue, then recommend the single highest-priority governed fix.", "the agent's goal")
+	checks := fs.String("checks", "examples/meridian/conflicts.yaml", "conflict checks YAML")
+	_ = fs.Parse(argv)
+
+	if !copilot.Available() {
+		fail(fmt.Errorf("copilot is the AI showcase — set LLM_BASE_URL/LLM_API_KEY/LLM_MODEL first"))
+	}
+	ctx := context.Background()
+	eng, err := engine.New(ctx, *model, *dsn)
+	if err != nil {
+		fail(err)
+	}
+	defer eng.Close()
+
+	agent, err := copilot.New(eng, governance.DefaultPolicy(), *checks)
+	if err != nil {
+		fail(err)
+	}
+	defer agent.Close()
+
+	fmt.Fprintf(os.Stderr, "-- copilot goal: %s\n\n", *goal)
+	res, err := agent.Run(ctx, *goal)
+	if err != nil {
+		fail(err)
+	}
+	fmt.Printf("%s\n", res.Answer)
+	fmt.Fprintf(os.Stderr, "\n-- agent: steps=%d tool_calls=%d tools=%v\n", res.Steps, res.ToolCalls, res.Tools)
+}
+
+// runReconcile detects cross-source data conflicts (deterministic SQL checks)
+// and, when LLM_* is set, has the LLM triage each conflict — likely cause,
+// system-of-record, recommended fix. Detection is reliable; AI adds judgment.
+func runReconcile(argv []string) {
+	fs := flag.NewFlagSet("reconcile", flag.ExitOnError)
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	checks := fs.String("checks", "examples/meridian/conflicts.yaml", "conflict checks YAML")
+	ai := fs.Bool("ai", true, "LLM triage of each conflict when LLM_* is set")
+	_ = fs.Parse(argv)
+
+	ctx := context.Background()
+	wh, err := warehouse.Open(ctx, *dsn, warehouse.Options{})
+	if err != nil {
+		fail(err)
+	}
+	defer wh.Close()
+	cs, err := reconcile.Load(*checks)
+	if err != nil {
+		fail(err)
+	}
+
+	var ask reconcile.AskFunc
+	mode := "detection only"
+	if *ai {
+		if a, name, ok := engineerLLM(); ok {
+			ask = reconcile.AskFunc(a)
+			mode = "detection + " + name + " triage"
+		}
+	}
+	results, err := reconcile.Run(ctx, wh, cs, ask)
+	if err != nil {
+		fail(err)
+	}
+
+	total := 0
+	for _, r := range results {
+		mark := "✓"
+		if r.Count() > 0 {
+			mark = "✗"
+			total += r.Count()
+		}
+		fmt.Printf("\n%s [%s] %s — %d conflict(s)\n", mark, r.Check.Severity, r.Check.Name, r.Count())
+		for i, row := range r.Rows {
+			if i >= 5 {
+				fmt.Printf("    … and %d more\n", r.Count()-5)
+				break
+			}
+			cells := make([]string, len(row))
+			for j, v := range row {
+				cells[j] = fmt.Sprintf("%v", v)
+			}
+			fmt.Printf("    %s\n", strings.Join(cells, " | "))
+		}
+		if r.Triage != "" {
+			fmt.Printf("  🧠 AI triage: %s\n", r.Triage)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "\n-- %s · %d total conflict(s) across %d check(s)\n", mode, total, len(results))
+}
+
+// runSpend shows or resets the per-tenant spend ledger (M13/M21):
+//
+//	di spend            # list cumulative cost per tenant
+//	di spend reset -tenant acme
+func runSpend(argv []string) {
+	fs := flag.NewFlagSet("spend", flag.ExitOnError)
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	tenant := fs.String("tenant", "", "tenant id (for reset)")
+	reset := len(argv) > 0 && argv[0] == "reset"
+	if reset {
+		argv = argv[1:]
+	}
+	_ = fs.Parse(argv)
+
+	ctx := context.Background()
+	wh, err := warehouse.Open(ctx, *dsn, warehouse.Options{})
+	if err != nil {
+		fail(err)
+	}
+	defer wh.Close()
+	ledger := governance.NewSpendLedger(wh)
+
+	if reset {
+		if *tenant == "" {
+			fail(fmt.Errorf("reset needs -tenant"))
+		}
+		if err := ledger.Reset(ctx, *tenant); err != nil {
+			fail(err)
+		}
+		fmt.Printf("reset spend for %q\n", *tenant)
+		return
+	}
+	rows, err := ledger.All(ctx)
+	if err != nil {
+		fail(err)
+	}
+	if len(rows) == 0 {
+		fmt.Println("(no spend recorded)")
+		return
+	}
+	fmt.Printf("%-16s %14s %9s\n", "tenant", "bytes", "queries")
+	for _, r := range rows {
+		fmt.Printf("%-16s %14d %9d\n", r.Tenant, r.Bytes, r.Queries)
+	}
+}
+
+// runTrace demonstrates real OpenTelemetry with W3C trace-context propagation
+// (M20): a client span injects a traceparent into a carrier; the "server" side
+// extracts it and runs a governed query whose compile/plan/execute spans nest
+// under the SAME trace_id — the cross-process linkage, proven end to end.
+func runTrace(argv []string) {
+	fs := flag.NewFlagSet("trace", flag.ExitOnError)
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	metrics := fs.String("metrics", "total_revenue", "metrics to query")
+	by := fs.String("by", "store_region", "group-by dimensions")
+	role := fs.String("role", "finance", "caller role")
+	_ = fs.Parse(argv)
+
+	if _, err := obs.InitOTel("safesqlproxy"); err != nil {
+		fail(err)
+	}
+	ctx := context.Background()
+
+	// --- client side: start a span and inject its traceparent into a carrier ---
+	cctx, client := obs.Tracer().Start(ctx, "client_request")
+	carrier := map[string]string{}
+	obs.InjectMap(cctx, carrier)
+	clientTrace := oteltrace.SpanContextFromContext(cctx).TraceID().String()
+	fmt.Printf("client span trace_id = %s\n", clientTrace)
+	fmt.Printf("propagated traceparent = %s\n", carrier["traceparent"])
+	client.End()
+
+	// --- server side: extract the remote context, then run a real query ---
+	sctx := obs.ExtractMap(context.Background(), carrier)
+	serverTrace := oteltrace.SpanContextFromContext(sctx).TraceID().String()
+	fmt.Printf("server extracted trace_id = %s  (match=%v)\n", serverTrace, serverTrace == clientTrace)
+
+	eng, err := engine.New(sctx, "models/meridian.yaml", *dsn)
+	if err != nil {
+		fail(err)
+	}
+	defer eng.Close()
+	_, err = governance.Query(sctx, eng, semantic.Query{Metrics: split(*metrics), GroupBy: split(*by)},
+		governance.Principal{User: "cli", Role: *role}, governance.DefaultPolicy())
+	if err != nil {
+		fail(err)
+	}
+	fmt.Fprintln(os.Stderr, "-- the otel spans above (governed_query→compile/plan/execute) share the client's trace_id")
+}
+
+// runPentest is the automated MCP-security regression (M17, lesson 75): it
+// fires a battery of forged tokens at the real OIDC verifier and asserts every
+// attack is rejected and the one good token is accepted. Exit 1 if any attack
+// gets through — a CI gate so a security control can never silently regress.
+func runPentest(argv []string) {
+	_ = argv // no flags; the gate is self-contained
+	ctx := context.Background()
+	const issuer, aud = "https://di-issuer.local", "warehouse"
+
+	priv, err := mcpserver.GenerateKey(2048)
+	if err != nil {
+		fail(err)
+	}
+	pubPEM, err := mcpserver.MarshalPublicKeyPEM(&priv.PublicKey)
+	if err != nil {
+		fail(err)
+	}
+	evil, _ := mcpserver.GenerateKey(2048) // attacker's key, not trusted
+
+	oidc, err := mcpserver.NewOIDC(mcpserver.OIDCConfig{Issuer: issuer, Audience: aud, PublicKeyPEM: pubPEM, KeyID: "k1"})
+	if err != nil {
+		fail(err)
+	}
+	verify := oidc.Verifier()
+	now := time.Now()
+	base := func() map[string]any {
+		return map[string]any{"iss": issuer, "aud": aud, "sub": "u1", "role": "analyst",
+			"exp": now.Add(time.Hour).Unix(), "nbf": now.Add(-time.Minute).Unix()}
+	}
+	sign := func(p *rsa.PrivateKey, kid string, c map[string]any) string {
+		t, e := mcpserver.SignJWT(p, kid, c)
+		if e != nil {
+			fail(e)
+		}
+		return t
+	}
+
+	type attack struct {
+		name       string
+		token      string
+		wantAccept bool
+	}
+	var attacks []attack
+	attacks = append(attacks, attack{"valid token (control)", sign(priv, "k1", base()), true})
+	attacks = append(attacks, attack{"no token", "", false})
+	attacks = append(attacks, attack{"malformed jwt", "not.a.jwt.token", false})
+	// expired
+	c := base()
+	c["exp"] = now.Add(-time.Hour).Unix()
+	attacks = append(attacks, attack{"expired token", sign(priv, "k1", c), false})
+	// not yet valid
+	c = base()
+	c["nbf"] = now.Add(time.Hour).Unix()
+	attacks = append(attacks, attack{"not-yet-valid (nbf future)", sign(priv, "k1", c), false})
+	// wrong audience — the confused-deputy attack
+	c = base()
+	c["aud"] = "some-other-service"
+	attacks = append(attacks, attack{"wrong audience (confused deputy)", sign(priv, "k1", c), false})
+	// wrong issuer
+	c = base()
+	c["iss"] = "https://evil-issuer.local"
+	attacks = append(attacks, attack{"untrusted issuer", sign(priv, "k1", c), false})
+	// forged signature (attacker key)
+	attacks = append(attacks, attack{"forged signature (attacker key)", sign(evil, "k1", base()), false})
+	// tampered signature
+	good := sign(priv, "k1", base())
+	attacks = append(attacks, attack{"tampered signature", good[:len(good)-2] + "AA", false})
+
+	fmt.Println("MCP security pen-test — forged tokens vs the real OIDC verifier:")
+	failures := 0
+	for _, a := range attacks {
+		_, verr := verify(ctx, a.token, nil)
+		accepted := verr == nil
+		ok := accepted == a.wantAccept
+		mark := "✓"
+		if !ok {
+			mark = "✗"
+			failures++
+		}
+		verdict := "REJECTED"
+		if accepted {
+			verdict = "ACCEPTED"
+		}
+		fmt.Printf("  %s %-34s → %s\n", mark, a.name, verdict)
+	}
+
+	// Authorization probe: an unauthorized metric must be refused at the
+	// governance boundary even with a perfectly valid token.
+	eng, err := engine.New(ctx, "models/meridian.yaml", envOr("DI_DSN", defaultDSN))
+	if err == nil {
+		defer eng.Close()
+		_, qerr := governance.Query(ctx, eng, semantic.Query{Metrics: []string{"net_revenue"}},
+			governance.Principal{User: "u1", Role: "analyst"}, governance.DefaultPolicy())
+		mark := "✓"
+		if qerr == nil {
+			mark = "✗"
+			failures++
+		}
+		fmt.Printf("  %s %-34s → %s\n", mark, "unauthorized metric (net_revenue)", boolStr(qerr != nil, "REFUSED", "LEAKED"))
+	}
+
+	if failures > 0 {
+		fmt.Fprintf(os.Stderr, "\nPEN-TEST FAILED: %d control(s) breached\n", failures)
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stderr, "\n-- pen-test passed: all %d attacks rejected, controls intact\n", len(attacks))
+}
+
+func boolStr(b bool, t, f string) string {
+	if b {
+		return t
+	}
+	return f
+}
+
+// runRollout drives the production change-management plane (M21): version
+// registry, canary traffic-split, lineage-driven invalidation.
+//
+//	di rollout register -name v2 -model models/candidate.yaml
+//	di rollout list
+//	di rollout canary  -name v2 -pct 10
+//	di rollout sign    -name v2 -by li -note "reviewed the revenue definition"
+//	di rollout promote -name v2     # refuses unless signed; prints lineage delta
+//	di rollout ledger               # who changed which numbers, and when
+//	di rollout attest               # which answers came from a signed definition
+//	di rollout history -name v2     # the decision chain in the brain: signed, superseded, why
+//	di rollout resync               # write ledger lines the brain missed
+//	di rollout rollback             # panic button
+//	di rollout simulate -pct 10 -n 1000
+func runRollout(argv []string) {
+	if len(argv) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: di rollout <register|list|canary|sign|promote|rollback|ledger|attest|history|resync|simulate> [flags]")
+		os.Exit(2)
+	}
+	sub, rest := argv[0], argv[1:]
+	fs := flag.NewFlagSet("rollout "+sub, flag.ExitOnError)
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	name := fs.String("name", "", "version name")
+	model := fs.String("model", "", "model YAML path (register)")
+	pct := fs.Int("pct", 0, "canary percentage 0..100")
+	n := fs.Int("n", 1000, "number of synthetic requests (simulate)")
+	minHealth := fs.Float64("min", 1.0, "canary health floor (watch): auto-rollback below this")
+	by := fs.String("by", "", "who is approving this model (sign)")
+	hash := fs.String("hash", "", "the hash you read, if you want it checked against the file (sign)")
+	note := fs.String("note", "", "why this change was approved (sign)")
+	_ = fs.Parse(rest)
+
+	ctx := context.Background()
+	wh, err := warehouse.Open(ctx, *dsn, warehouse.Options{})
+	if err != nil {
+		fail(err)
+	}
+	defer wh.Close()
+	reg := rollout.New(wh, func() string { return time.Now().UTC().Format(time.RFC3339) })
+	// Without the brain the signatures land only in the warehouse ledger,
+	// and DecisionChain has nothing to walk. The mirror is best-effort by
+	// design (see rollout/mirror.go); a deployment with no brain still signs.
+	closeBrain := attachBrain(ctx, reg)
+	defer closeBrain()
+
+	switch sub {
+	case "register":
+		if *name == "" || *model == "" {
+			fail(fmt.Errorf("register needs -name and -model"))
+		}
+		v, err := reg.Register(ctx, *name, *model)
+		if err != nil {
+			fail(err)
+		}
+		fmt.Printf("registered %s (hash %s) as %s\n", v.Name, v.Hash, v.Status)
+	case "list":
+		vs, err := reg.List(ctx)
+		if err != nil {
+			fail(err)
+		}
+		for _, v := range vs {
+			pctStr := ""
+			if v.Status == rollout.StatusCanary {
+				pctStr = fmt.Sprintf(" @%d%%", v.CanaryPct)
+			}
+			fmt.Printf("%-10s %-10s%s  hash=%s  %s\n", v.Name, v.Status, pctStr, v.Hash, v.Path)
+		}
+	case "canary":
+		v, err := reg.Canary(ctx, *name, *pct)
+		if err != nil {
+			fail(err)
+		}
+		fmt.Printf("%s now canary @ %d%% of traffic\n", v.Name, v.CanaryPct)
+	case "sign":
+		if *name == "" || *by == "" {
+			fail(fmt.Errorf("sign needs -name and -by"))
+		}
+		v, err := reg.Sign(ctx, *name, *hash, *by, *note)
+		if err != nil {
+			fail(err)
+		}
+		fmt.Printf("%s signed by %s at %s (hash %s)\n", v.Name, v.SignedBy, v.SignedAt, v.SignedHash)
+	case "ledger":
+		entries, err := reg.Ledger(ctx)
+		if err != nil {
+			fail(err)
+		}
+		if len(entries) == 0 {
+			fmt.Println("-- no model changes recorded yet")
+			break
+		}
+		for _, e := range entries {
+			line := fmt.Sprintf("%-20s %-8s %-10s by %-12s %s", e.At, e.Act, e.Name, e.By, e.ToHash)
+			if e.Changed != "" {
+				line += "  changed: " + e.Changed
+			}
+			if e.Note != "" {
+				line += "  — " + e.Note
+			}
+			fmt.Println(line)
+		}
+	case "history":
+		h, err := reg.History(ctx, *name)
+		if err != nil {
+			fail(err)
+		}
+		fmt.Printf("%s  %s  hash %s\n", h.Name, h.Status, h.Hash)
+		for _, d := range h.Chain.Decisions {
+			line := fmt.Sprintf("  %-20s %-17s by %-10s", d.At, d.Kind, d.Actor)
+			// The note carries the prose on its first line and a machine
+			// payload after it; a person reading the chain wants the prose.
+			if first, _, _ := strings.Cut(d.Note, "\n"); first != "" {
+				line += "  — " + first
+			}
+			fmt.Println(line)
+		}
+		if len(h.Chain.Decisions) == 0 {
+			fmt.Println("  (no decision in the brain for this version yet)")
+		}
+		if n := len(h.Unmirrored); n > 0 {
+			fmt.Printf("\n%d ledger line(s) for this version are not in the brain — `di rollout resync` writes them\n", n)
+		}
+	case "resync":
+		n, err := reg.Resync(ctx)
+		if err != nil {
+			fail(err)
+		}
+		fmt.Printf("wrote %d decision(s) from the ledger into the brain\n", n)
+	case "attest":
+		all, err := reg.Attest(ctx)
+		if err != nil {
+			fail(err)
+		}
+		if len(all) == 0 {
+			fmt.Println("-- no answers in the trail yet")
+			break
+		}
+		for _, a := range all {
+			who := a.SignedBy
+			if who == "" {
+				who = "NOBODY"
+			}
+			h := a.Hash
+			if h == "" {
+				h = "(no model recorded)"
+			}
+			line := fmt.Sprintf("%-22s %6d answers  signed by %s", h, a.Answers, who)
+			if !a.Promoted {
+				line += "  ** never promoted through the registry **"
+			} else if a.BeforeApproval > 0 {
+				line += fmt.Sprintf("  (%d given before it went live on %s)", a.BeforeApproval, a.ApprovedAt)
+			}
+			if a.Note != "" {
+				line += "  — " + a.Note
+			}
+			fmt.Println(line)
+		}
+		if bad := rollout.Unattested(all); len(bad) > 0 {
+			n := 0
+			for _, b := range bad {
+				n += b.Answers
+			}
+			fmt.Printf("\n%d answer(s) came from %d model(s) nobody approved.\n", n, len(bad))
+		}
+	case "promote":
+		changed, err := reg.Promote(ctx, *name)
+		if err != nil {
+			fail(err)
+		}
+		fmt.Printf("%s is now ACTIVE\n", *name)
+		if len(changed) == 0 {
+			fmt.Println("lineage: no metric definitions changed — no caches to invalidate")
+		} else {
+			fmt.Printf("lineage: %d metric(s) changed → invalidate caches for: %v\n", len(changed), changed)
+		}
+	case "rollback":
+		v, err := reg.Rollback(ctx)
+		if err != nil {
+			fail(err)
+		}
+		if v == nil {
+			fmt.Println("rollback: nothing to restore")
+		} else {
+			fmt.Printf("rolled back — %s restored to ACTIVE\n", v.Name)
+		}
+	case "simulate":
+		counts := map[string]int{}
+		for i := 0; i < *n; i++ {
+			v, err := reg.Route(ctx, fmt.Sprintf("req-%d", i))
+			if err != nil {
+				fail(err)
+			}
+			counts[v.Name+" ("+v.Status+")"]++
+		}
+		fmt.Printf("routed %d requests:\n", *n)
+		for k, c := range counts {
+			fmt.Printf("  %-24s %5d  (%.1f%%)\n", k, c, 100*float64(c)/float64(*n))
+		}
+	case "watch":
+		// Health-check the live canary; auto-rollback if it regresses below the
+		// floor — the unattended guard so a bad canary self-heals.
+		cv, err := reg.CanaryVersion(ctx)
+		if err != nil {
+			fail(fmt.Errorf("no canary to watch: %w", err))
+		}
+		score, failed, err := healthScore(ctx, cv.Path, *dsn)
+		if err != nil {
+			fail(err)
+		}
+		fmt.Printf("canary %s health=%.0f%% (floor %.0f%%)", cv.Name, score*100, *minHealth*100)
+		if len(failed) > 0 {
+			fmt.Printf(" · failing: %v", failed)
+		}
+		fmt.Println()
+		if score < *minHealth {
+			rb, rerr := reg.Rollback(ctx)
+			if rerr != nil {
+				fail(rerr)
+			}
+			if rb != nil {
+				fmt.Printf("REGRESSION → auto-rolled back; %s is ACTIVE, canary demoted\n", rb.Name)
+			} else {
+				fmt.Println("REGRESSION → canary demoted (no active version)")
+			}
+			os.Exit(1)
+		}
+		fmt.Println("canary healthy — safe to keep promoting")
+	default:
+		fail(fmt.Errorf("unknown rollout subcommand %q", sub))
+	}
+}
+
+// runThreats is the threat-model-as-code gate (M11): every threat must name a
+// control + owner + evidence and be mitigated or accepted. Exits 1 on any
+// unaddressed or under-specified threat so it can guard a merge in CI.
+func runThreats(argv []string) {
+	fs := flag.NewFlagSet("threats", flag.ExitOnError)
+	path := fs.String("file", envOr("DI_THREATS", "examples/meridian/threats.yaml"), "threat model YAML")
+	_ = fs.Parse(argv)
+
+	tm, err := governance.LoadThreatModel(*path)
+	if err != nil {
+		fail(err)
+	}
+	issues := tm.Check()
+	for _, t := range tm.Threats {
+		mark := "✓"
+		if t.Status != governance.ThreatMitigated && t.Status != governance.ThreatAccepted {
+			mark = "✗"
+		}
+		fmt.Printf("%s %-22s %-10s %s\n", mark, t.ID, t.Status, t.Title)
+	}
+	if len(issues) > 0 {
+		fmt.Fprintln(os.Stderr, "\nTHREAT MODEL GATE FAILED:")
+		for _, i := range issues {
+			fmt.Fprintln(os.Stderr, "  - "+i)
+		}
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stderr, "-- threat model OK: %d threat(s), all addressed\n", len(tm.Threats))
+}
+
+// runEval is the reconciliation / regression / drift gate: every metric must
+// match a hand-written control query. Non-zero exit on fail.
+func runEval(argv []string) {
+	fs := flag.NewFlagSet("eval", flag.ExitOnError)
+	model := fs.String("model", "models/meridian.yaml", "semantic model YAML")
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	recon := fs.String("recon", "", "reconciliation set (default: <model>.recon.yaml)")
+	engFile := fs.String("engagement", "", "take model/dsn/recon from an engagement.yaml")
+	db := fs.String("database", "", "which database in the engagement")
+	_ = fs.Parse(argv)
+
+	if _, m, d, r, _, _, ok := fromEngagement(*engFile, *db); ok {
+		if m == "" {
+			fail(fmt.Errorf("database %q has no semantic model yet — nothing to reconcile", *db))
+		}
+		model, dsn, recon = &m, &d, &r
+	}
+
+	ctx := context.Background()
+	rep, eng, err := reconcileModel(ctx, *model, *dsn, *recon)
+	if err != nil {
+		fail(err)
+	}
+	defer eng.Close()
+
+	for _, r := range rep.Results {
+		switch {
+		case r.Error != "":
+			fmt.Printf("  [FAIL] %-18s %s\n", r.Metric, r.Error)
+		case r.Pass:
+			fmt.Printf("  [PASS] %-18s %s\n", r.Metric, nleval.Num(r.Got))
+		default:
+			fmt.Printf("  [FAIL] %-18s got=%s want=%s\n", r.Metric, nleval.Num(r.Got), nleval.Num(r.Want))
+		}
+	}
+	if un := rep.Uncovered(eng.Model); len(un) > 0 {
+		// Coverage is stated, not implied. "5/5 passed" over forty metrics is a
+		// different claim than 5/5 over five, and only one is worth trusting.
+		fmt.Printf("  [GAP]  %d metric(s) have no control query: %s\n", len(un), strings.Join(un, ", "))
+	}
+	fmt.Printf("eval: %d/%d passed (%d of %d metrics covered)\n",
+		rep.Passed, rep.Total, rep.Covered, rep.Declared)
+	if rep.Passed != rep.Total {
+		os.Exit(1) // regression / drift detected
+	}
+}
+
+// reconcileModel loads a model, its reconciliation set, and runs the gate. The
+// set lives beside the model as data: it was Go code listing one example's
+// metrics, so standing up a new customer produced a green check for metrics
+// that customer does not have — verification that verified nothing.
+func reconcileModel(ctx context.Context, modelPath, dsn, reconPath string) (*nleval.ReconReport, *engine.Engine, error) {
+	if reconPath == "" {
+		reconPath = nleval.ReconPathFor(modelPath)
+	}
+	set, err := nleval.LoadReconSet(reconPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil, fmt.Errorf("no reconciliation set at %s — write one:\n\ncases:\n  - metric: total_revenue\n    control: SELECT sum(quantity*unit_price) FROM order_items\n    note: why this definition, in the customer's words", reconPath)
+		}
+		return nil, nil, err
+	}
+	eng, err := engine.New(ctx, modelPath, dsn)
+	if err != nil {
+		return nil, nil, err
+	}
+	rep, err := nleval.Reconcile(ctx, eng, set)
+	if err != nil {
+		eng.Close()
+		return nil, nil, err
+	}
+	return rep, eng, nil
+}
+
+// healthScore runs the reconciliation checks against a model and returns the
+// fraction that match their control query — the canary's health signal.
+func healthScore(ctx context.Context, modelPath, dsn string) (float64, []string, error) {
+	rep, eng, err := reconcileModel(ctx, modelPath, dsn, "")
+	if err != nil {
+		return 0, nil, err
+	}
+	defer eng.Close()
+	if rep.Total == 0 {
+		return 0, nil, fmt.Errorf("no reconciliation cases for %s", modelPath)
+	}
+	var failed []string
+	for _, r := range rep.Results {
+		if !r.Pass {
+			failed = append(failed, r.Metric)
+		}
+	}
+	return float64(rep.Passed) / float64(rep.Total), failed, nil
+}
+
+// runNLEval is the natural-language evaluation closed-loop:
+// it grades a labeled question set on the three axes (semantic / execution /
+// result) + governance probes, prints per-category accuracy + a metric-confusion
+// matrix, persists to the accuracy dashboard, and fails CI on a regression.
+func runNLEval(argv []string) {
+	fs := flag.NewFlagSet("nleval", flag.ExitOnError)
+	model := fs.String("model", "models/meridian.yaml", "semantic model YAML")
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	set := fs.String("set", "models/nl_evalset.yaml", "labeled eval set YAML")
+	min := fs.Float64("min", 0.8, "overall accuracy floor for the CI gate")
+	floors := fs.String("floor", "governance=1.0", "per-category floors, e.g. governance=1.0,grouped=0.9")
+	judge := fs.Bool("judge", true, "run the LLM-judge groundedness layer when creds are present")
+	save := fs.Bool("save", true, "persist results to the accuracy dashboard tables")
+	jsonOut := fs.String("json", "", "also write the machine-readable report to this path")
+	_ = fs.Parse(argv)
+
+	ctx := context.Background()
+	eng, err := engine.New(ctx, *model, *dsn)
+	if err != nil {
+		fail(err)
+	}
+	defer eng.Close()
+
+	ds, err := nleval.Load(*set)
+	if err != nil {
+		fail(err)
+	}
+
+	dir, _ := os.MkdirTemp("", "di-nleval-")
+	defer os.RemoveAll(dir)
+	g, err := grounding.New(ctx, eng.Model, filepath.Join(dir, "idx.db"))
+	if err != nil {
+		fail(err)
+	}
+	defer g.Close()
+	if bank, err := grounding.LoadExemplars(ctx, "models/exemplars.yaml"); err == nil {
+		g.WithExemplars(bank)
+	}
+	llmWired := strings.Contains(g.Mode(), "llm")
+	fmt.Fprintf(os.Stderr, "-- grounding=%s · set=%s · cases=%d\n", g.Mode(), *set, len(ds.Cases))
+
+	grader := &nleval.Grader{Eng: eng, Gr: g, Pol: governance.DefaultPolicy()}
+	rep := grader.Run(ctx, ds, llmWired)
+	rep.WriteConsole(os.Stdout)
+
+	if *judge {
+		jr, err := nleval.Judge(ctx, rep)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "judge: %v\n", err)
+		} else {
+			jr.WriteConsole(os.Stdout)
+		}
+	}
+
+	if *save {
+		runID, err := rep.Save(ctx, eng.WH, time.Now().UnixNano())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "save: %v\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "-- saved run %s to _nl_eval_runs/_nl_eval_cases\n", runID)
+		}
+	}
+	if *jsonOut != "" {
+		f, err := os.Create(*jsonOut)
+		if err != nil {
+			fail(err)
+		}
+		_ = rep.WriteJSON(f)
+		_ = f.Close()
+	}
+
+	ok, fails := rep.Gate(*min, parseFloors(*floors))
+	if !ok {
+		fmt.Fprintf(os.Stderr, "\nGATE FAILED:\n")
+		for _, f := range fails {
+			fmt.Fprintf(os.Stderr, "  - %s\n", f)
+		}
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stderr, "\nGATE PASSED ✅  (accuracy %.0f%% ≥ %.0f%%)\n", rep.Acc*100, *min*100)
+}
+
+// runExemplar promotes a (question → semantic query) pair into the few-shot bank
+// ("promote every fixed miss into the bank"). It appends to the
+// YAML so the fix is durable and embeds the new question for retrieval.
+func runExemplar(argv []string) {
+	fs := flag.NewFlagSet("exemplar", flag.ExitOnError)
+	path := fs.String("bank", "models/exemplars.yaml", "exemplar bank YAML")
+	metrics := fs.String("metrics", "", "comma-separated metrics (required)")
+	by := fs.String("by", "", "comma-separated group-by dimensions")
+	grain := fs.String("grain", "", "time grain")
+	_ = fs.Parse(argv)
+	question := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if question == "" || *metrics == "" {
+		fmt.Fprintln(os.Stderr, `di exemplar -metrics net_revenue -by store_region "net revenue by region"`)
+		os.Exit(2)
+	}
+	ctx := context.Background()
+	bank, err := grounding.LoadExemplars(ctx, *path)
+	if err != nil {
+		fail(err)
+	}
+	q := semantic.Query{Metrics: split(*metrics), GroupBy: split(*by), TimeGrain: *grain}
+	if err := bank.Promote(ctx, question, q); err != nil {
+		fail(err)
+	}
+	fmt.Printf("promoted exemplar → %s (now %d in bank)\n", *path, bank.Len())
+}
+
+// parseFloors parses "cat=0.9,other=1.0" into a map.
+func parseFloors(s string) map[string]float64 {
+	out := map[string]float64{}
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		if f, err := strconv.ParseFloat(strings.TrimSpace(kv[1]), 64); err == nil {
+			out[strings.TrimSpace(kv[0])] = f
+		}
+	}
+	return out
+}
+
+// runDashboard renders a multi-panel dashboard. Panels are preset here; the
+// NL→dashboard hook (agent-go LLM → panel specs) plugs in at panelsFor().
+func runDashboard(argv []string) {
+	fs := flag.NewFlagSet("dashboard", flag.ExitOnError)
+	model := fs.String("model", "models/meridian.yaml", "semantic model YAML")
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	role := fs.String("role", "analyst", "caller role")
+	_ = fs.Parse(argv)
+
+	ctx := context.Background()
+	eng, err := engine.New(ctx, *model, *dsn)
+	if err != nil {
+		fail(err)
+	}
+	defer eng.Close()
+
+	type panel struct {
+		title string
+		q     semantic.Query
+	}
+	panels := []panel{
+		{"Revenue by region", semantic.Query{Metrics: []string{"total_revenue"}, GroupBy: []string{"store_region"}}},
+		{"Revenue by category", semantic.Query{Metrics: []string{"total_revenue"}, GroupBy: []string{"product_category"}}},
+		{"Orders by segment", semantic.Query{Metrics: []string{"order_count"}, GroupBy: []string{"customer_segment"}}},
+	}
+	for _, p := range panels {
+		fmt.Printf("\n### %s\n", p.title)
+		ans, err := governance.Query(ctx, eng, p.q, governance.Principal{User: "cli", Role: *role}, governance.DefaultPolicy())
+		if err != nil {
+			fmt.Printf("  (error: %v)\n", err)
+			continue
+		}
+		printAnswer(ans)
+	}
+}
+
+// runAgent runs a multi-step analyst using agent-go's loop (plan → call tools →
+// reason → answer) over our governed MCP server. agent-go owns the loop; the MCP
+// tools own correctness + governance. The "critique" discipline is in the prompt.
+func runAgent(argv []string) {
+	fs := flag.NewFlagSet("agent", flag.ExitOnError)
+	model := fs.String("model", "models/meridian.yaml", "semantic model YAML")
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	role := fs.String("role", "analyst", "role the MCP server runs queries as")
+	_ = fs.Parse(argv)
+	question := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if question == "" {
+		fmt.Fprintln(os.Stderr, `di agent: provide a question, e.g. di agent "which region has the highest revenue, and its AOV?"`)
+		os.Exit(2)
+	}
+	base, key, mdl := os.Getenv("LLM_BASE_URL"), os.Getenv("LLM_API_KEY"), os.Getenv("LLM_MODEL")
+	if base == "" || key == "" || mdl == "" {
+		fail(fmt.Errorf("agent loop needs an LLM: set LLM_BASE_URL / LLM_API_KEY / LLM_MODEL"))
+	}
+
+	// MCP server config: spawn THIS binary in `mcp` mode as a stdio tool server.
+	exe, err := os.Executable()
+	if err != nil {
+		fail(err)
+	}
+	absModel, _ := filepath.Abs(*model)
+	cfg := map[string]any{"mcpServers": map[string]any{
+		"safesqlproxy": map[string]any{
+			"type": "stdio", "command": exe,
+			"args": []string{"mcp", "-model", absModel, "-dsn", *dsn, "-role", *role},
+		},
+	}}
+	dir, _ := os.MkdirTemp("", "di-agent-")
+	defer os.RemoveAll(dir)
+	cfgPath := filepath.Join(dir, "mcpServers.json")
+	b, _ := json.Marshal(cfg)
+	if err := os.WriteFile(cfgPath, b, 0o600); err != nil {
+		fail(err)
+	}
+
+	llm, err := providers.NewOpenAILLMProvider(&domain.OpenAIProviderConfig{BaseURL: base, APIKey: key, LLMModel: mdl})
+	if err != nil {
+		fail(err)
+	}
+
+	const sys = `You are a data analyst. Answer ONLY using the warehouse MCP tools
+(list_metrics, get_dimensions, query_metric). Never write SQL.
+Plan: discover metrics with list_metrics; check valid dimensions with get_dimensions
+BEFORE grouping; call query_metric; then sanity-check (right metric? right grain?
+plausible range?). For multi-part questions, query step by step and chain results.
+If a query is refused or a metric is missing, say so honestly — never fabricate a number.`
+
+	ctx := context.Background()
+	// Native tool-calling over the MCP tools, not code execution. In v2 that
+	// took WithPTC(false); v3's Builder has no PTC to switch off, so the call
+	// goes rather than being translated into something that does nothing.
+	svc, err := agentpkg.New("di-analyst").
+		WithLLM(llm).
+		WithSystemPrompt(sys).
+		WithMCP(agentpkg.WithMCPConfigPaths(cfgPath)).
+		Build()
+	if err != nil {
+		fail(err)
+	}
+	defer svc.Close()
+
+	res, err := svc.Chat(ctx, question)
+	if err != nil {
+		fail(err)
+	}
+	fmt.Printf("%v\n", res.FinalResult)
+	fmt.Fprintf(os.Stderr, "\n-- agent: steps=%d tool_calls=%d tools=%v\n", res.StepsTotal, res.ToolCalls, res.ToolsUsed)
+}
+
+// runCDC watches a table for new rows (change-data-capture) and streams events.
+func runCDC(argv []string) {
+	fs := flag.NewFlagSet("cdc", flag.ExitOnError)
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	table := fs.String("table", "order_items", "table to watch")
+	cursor := fs.String("cursor", "item_id", "monotonic cursor column")
+	secs := fs.Int("for", 8, "seconds to watch")
+	_ = fs.Parse(argv)
+
+	ctx := context.Background()
+	wh, err := warehouse.Open(ctx, *dsn, warehouse.Options{})
+	if err != nil {
+		fail(err)
+	}
+	defer wh.Close()
+
+	cdc := &connectors.PostgresCDC{WH: wh, Table: *table, CursorCol: *cursor, Interval: time.Second}
+	if err := cdc.StartCursor(ctx); err != nil {
+		fail(err)
+	}
+	fmt.Printf("watching %q (cursor %q) for %ds...\n", *table, *cursor, *secs)
+	wctx, cancel := context.WithTimeout(ctx, time.Duration(*secs)*time.Second)
+	defer cancel()
+	ch, err := cdc.Subscribe(wctx)
+	if err != nil {
+		fail(err)
+	}
+	n := 0
+	for e := range ch {
+		n++
+		fmt.Printf("  [%s cursor=%d] %v\n", e.Op, e.Cursor, e.Record)
+	}
+	fmt.Printf("captured %d change event(s)\n", n)
+}
+
+func toI64(v any) int64 {
+	switch x := v.(type) {
+	case int64:
+		return x
+	case int:
+		return int64(x)
+	case float64:
+		return int64(x)
+	case []byte:
+		n, _ := strconv.ParseInt(string(x), 10, 64)
+		return n
+	case string:
+		n, _ := strconv.ParseInt(x, 10, 64)
+		return n
+	}
+	return 0
+}
+
+// runSync incrementally lands new rows from a LIVE source table into the
+// governed warehouse (Tier-2 CDC). Watermark = a monotonic cursor column; it
+// resumes from a persisted `_sync_state` (or the governed table's current max),
+// pulls only rows past the watermark, lands them into a staging table, runs an
+// optional transform (stage → governed, typically an upsert), and advances the
+// watermark. `-for` keeps polling on an interval to simulate streaming.
+func runSync(argv []string) {
+	fs := flag.NewFlagSet("sync", flag.ExitOnError)
+	srcDSN := fs.String("source", "", "live source DSN (required)")
+	table := fs.String("table", "", "source table to sync (required)")
+	cursor := fs.String("cursor", "id", "monotonic cursor column (e.g. sale_id)")
+	destDSN := fs.String("dest", envOr("DI_DSN", defaultDSN), "governed warehouse DSN")
+	stage := fs.String("stage", "", "dest staging table for the delta (default stg_<table>_cdc)")
+	destTable := fs.String("dest-table", "", "governed table to seed the initial watermark from (default = -table)")
+	required := fs.String("required", "", "comma-separated stage columns that must be non-empty")
+	after := fs.String("after", "", "SQL file run on dest after landing the delta (transform stage → governed)")
+	stateTable := fs.String("state", "_sync_state", "state table persisting the per-source watermark")
+	forSecs := fs.Int("for", 0, "if >0, keep syncing every -every seconds for this many seconds; else one-shot")
+	every := fs.Int("every", 5, "poll interval seconds when -for > 0")
+	_ = fs.Parse(argv)
+	if *srcDSN == "" || *table == "" {
+		fmt.Fprintln(os.Stderr, "di sync: -source and -table are required")
+		os.Exit(2)
+	}
+	if *stage == "" {
+		*stage = "stg_" + *table + "_cdc"
+	}
+	if *destTable == "" {
+		*destTable = *table
+	}
+
+	ctx := context.Background()
+	src, err := warehouse.Open(ctx, *srcDSN, warehouse.Options{MaxRows: 1000000})
+	if err != nil {
+		fail(err)
+	}
+	defer src.Close()
+	dest, err := warehouse.Open(ctx, *destDSN, warehouse.Options{MaxRows: 1000000})
+	if err != nil {
+		fail(err)
+	}
+	defer dest.Close()
+
+	if _, err := dest.Exec(ctx, fmt.Sprintf(
+		`CREATE TABLE IF NOT EXISTS %q (src_table text PRIMARY KEY, cursor bigint NOT NULL)`, *stateTable)); err != nil {
+		fail(err)
+	}
+	ensureIngestLog(ctx, dest)
+
+	// Stable, ordered source schema so the stage columns are identical every run.
+	scRes, err := src.Query(ctx,
+		`SELECT column_name FROM information_schema.columns WHERE table_name=$1 ORDER BY ordinal_position`, *table)
+	if err != nil {
+		fail(err)
+	}
+	schema := connectors.SourceSchema{Name: *table}
+	for _, r := range scRes.Rows {
+		schema.Fields = append(schema.Fields, connectors.Field{Name: fmt.Sprintf("%v", r[0]), Type: "text"})
+	}
+	if len(schema.Fields) == 0 {
+		fail(fmt.Errorf("source table %q not found or has no columns", *table))
+	}
+
+	afterSQL := ""
+	if *after != "" {
+		b, err := os.ReadFile(*after)
+		if err != nil {
+			fail(err)
+		}
+		afterSQL = string(b)
+	}
+
+	syncOnce := func() (int, int64) {
+		last := int64(0)
+		if r, err := dest.Query(ctx, fmt.Sprintf(`SELECT cursor FROM %q WHERE src_table=$1`, *stateTable), *table); err == nil && len(r.Rows) > 0 {
+			last = toI64(r.Rows[0][0])
+		} else if r, err := dest.Query(ctx, fmt.Sprintf(`SELECT COALESCE(MAX(%q),0) FROM %q`, *cursor, *destTable)); err == nil && len(r.Rows) > 0 {
+			last = toI64(r.Rows[0][0])
+		}
+		cdc := &connectors.PostgresCDC{WH: src, Table: *table, CursorCol: *cursor, Interval: time.Second}
+		cdc.SetCursor(last)
+		var rows []connectors.Record
+		maxCur := last
+		for {
+			events, err := cdc.Poll(ctx)
+			if err != nil {
+				fail(err)
+			}
+			if len(events) == 0 {
+				break
+			}
+			for _, e := range events {
+				rows = append(rows, e.Record)
+				if e.Cursor > maxCur {
+					maxCur = e.Cursor
+				}
+			}
+		}
+		if len(rows) == 0 {
+			return 0, last
+		}
+		if _, err := dest.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %q`, *stage)); err != nil {
+			fail(err)
+		}
+		plan := ingest.InferMapping(schema, *stage, nil)
+		plan.Required = split(*required)
+		rep, err := ingest.Run(ctx, dest, connectors.Batch{Schema: schema, Rows: rows}, plan)
+		if err != nil {
+			fail(err)
+		}
+		if afterSQL != "" {
+			if _, err := dest.Exec(ctx, afterSQL); err != nil {
+				fail(err)
+			}
+		}
+		if _, err := dest.Exec(ctx, fmt.Sprintf(
+			`INSERT INTO %q (src_table, cursor) VALUES ($1,$2) ON CONFLICT (src_table) DO UPDATE SET cursor=EXCLUDED.cursor`,
+			*stateTable), *table, maxCur); err != nil {
+			fail(err)
+		}
+		logIngest(ctx, dest, "cdc", "live-db delta: "+*table, int64(rep.RowsLanded), maxCur)
+		return rep.RowsLanded, maxCur
+	}
+
+	if *forSecs <= 0 {
+		n, wm := syncOnce()
+		fmt.Printf("synced %d new row(s) from %q → dest; watermark %s=%d\n", n, *table, *cursor, wm)
+		return
+	}
+	deadline := time.Now().Add(time.Duration(*forSecs) * time.Second)
+	total := 0
+	for time.Now().Before(deadline) {
+		n, wm := syncOnce()
+		total += n
+		fmt.Printf("[sync] +%d row(s), watermark=%d\n", n, wm)
+		time.Sleep(time.Duration(*every) * time.Second)
+	}
+	fmt.Printf("done: %d row(s) synced over %ds\n", total, *forSecs)
+}
+
+// ensureIngestLog creates the ingestion audit/provenance table if absent. Every
+// tier (file / CDC / webhook) appends one row per landing so a UI can show what
+// came in from where and when.
+func ensureIngestLog(ctx context.Context, wh *warehouse.Warehouse) {
+	_, _ = wh.Exec(ctx, `CREATE TABLE IF NOT EXISTS _ingest_log (
+		id bigserial PRIMARY KEY, source_type text, note text, rows bigint, watermark bigint,
+		ts timestamptz DEFAULT now())`)
+}
+
+func logIngest(ctx context.Context, wh *warehouse.Warehouse, srcType, note string, rows, watermark int64) {
+	_, _ = wh.Exec(ctx, `INSERT INTO _ingest_log (source_type, note, rows, watermark) VALUES ($1,$2,$3,$4)`,
+		srcType, note, rows, watermark)
+}
+
+// runIngestStatus serves a small JSON status endpoint (with CORS) so a browser
+// panel can visualize the ingestion pipeline: warehouse totals, per-source landed
+// counts, watermarks, and a recent-activity timeline. Read-only.
+func runIngestStatus(argv []string) {
+	fs := flag.NewFlagSet("ingest-status", flag.ExitOnError)
+	destDSN := fs.String("dest", envOr("DI_DSN", defaultDSN), "governed warehouse DSN")
+	addr := fs.String("addr", ":34300", "listen address")
+	factTable := fs.String("fact", "sales", "fact table for totals")
+	amountCol := fs.String("amount", "amount", "revenue column on the fact table")
+	cdcSrc := fs.String("cdc-source", "", "live source DSN — enables the 'pending rows not yet synced' diagnostic")
+	cdcTable := fs.String("cdc-table", "sales", "source table for pending detection")
+	cdcCursor := fs.String("cdc-cursor", "sale_id", "source cursor column")
+	actSync := fs.String("action-sync", "", "shell command run by POST /action/sync (e.g. a `di sync ...`)")
+	actTest := fs.String("action-test", "", "shell command run by POST /action/test (e.g. inject a test row into the source)")
+	_ = fs.Parse(argv)
+
+	ctx := context.Background()
+	wh, err := warehouse.Open(ctx, *destDSN, warehouse.Options{})
+	if err != nil {
+		fail(err)
+	}
+	defer wh.Close()
+	ensureIngestLog(ctx, wh)
+
+	var src *warehouse.Warehouse
+	if *cdcSrc != "" {
+		if src, err = warehouse.Open(ctx, *cdcSrc, warehouse.Options{}); err != nil {
+			fmt.Fprintf(os.Stderr, "cdc-source open failed (pending diagnostic disabled): %v\n", err)
+		} else {
+			defer src.Close()
+		}
+	}
+
+	q1 := func(sql string, args ...any) [][]any {
+		r, err := wh.Query(ctx, sql, args...)
+		if err != nil {
+			return nil
+		}
+		return r.Rows
+	}
+	status := func() map[string]any {
+		out := map[string]any{}
+		if rows := q1(fmt.Sprintf(`SELECT count(*), COALESCE(round(SUM(%q)),0) FROM %q`, *amountCol, *factTable)); len(rows) > 0 {
+			out["fact_rows"] = toI64(rows[0][0])
+			out["revenue"] = toI64(rows[0][1])
+		}
+		var bySource []map[string]any
+		for _, r := range q1(`SELECT source_type, COALESCE(SUM(rows),0), count(*), max(ts), EXTRACT(EPOCH FROM now()-max(ts))::bigint FROM _ingest_log GROUP BY source_type ORDER BY max(ts) DESC`) {
+			bySource = append(bySource, map[string]any{
+				"source_type": fmt.Sprintf("%v", r[0]), "rows": toI64(r[1]),
+				"events": toI64(r[2]), "last_ts": fmt.Sprintf("%v", r[3]), "age": toI64(r[4]),
+			})
+		}
+		out["by_source"] = bySource
+		var wm []map[string]any
+		for _, r := range q1(`SELECT src_table, cursor FROM _sync_state ORDER BY src_table`) {
+			wm = append(wm, map[string]any{"src_table": fmt.Sprintf("%v", r[0]), "cursor": toI64(r[1])})
+		}
+		out["watermarks"] = wm
+		var recent []map[string]any
+		for _, r := range q1(`SELECT source_type, note, rows, ts, EXTRACT(EPOCH FROM now()-ts)::bigint FROM _ingest_log ORDER BY ts DESC LIMIT 12`) {
+			recent = append(recent, map[string]any{
+				"source_type": fmt.Sprintf("%v", r[0]), "note": fmt.Sprintf("%v", r[1]),
+				"rows": toI64(r[2]), "ts": fmt.Sprintf("%v", r[3]), "age": toI64(r[4]),
+			})
+		}
+		out["recent"] = recent
+
+		// Diagnostics: real signal — live source ahead of the CDC watermark means
+		// there are new rows waiting to be synced into the governed warehouse.
+		var diags []map[string]any
+		if src != nil {
+			var wmCur int64
+			if r := q1(`SELECT cursor FROM _sync_state WHERE src_table=$1`, *cdcTable); len(r) > 0 {
+				wmCur = toI64(r[0][0])
+			} else if r := q1(fmt.Sprintf(`SELECT COALESCE(MAX(%q),0) FROM %q`, *cdcCursor, *factTable)); len(r) > 0 {
+				wmCur = toI64(r[0][0])
+			}
+			if sr, err := src.Query(ctx, fmt.Sprintf(`SELECT COALESCE(MAX(%q),0) FROM %q`, *cdcCursor, *cdcTable)); err == nil && len(sr.Rows) > 0 {
+				pending := toI64(sr.Rows[0][0]) - wmCur
+				if pending > 0 {
+					diags = append(diags, map[string]any{
+						"level": "warn", "source": "cdc",
+						"message": fmt.Sprintf("live DB has %d new transaction(s) not yet synced (watermark stuck at %d); click 'Sync now' to land the delta into the warehouse.", pending, wmCur),
+						"action":  "sync", "action_label": "Sync now",
+					})
+				}
+			}
+		}
+		out["diagnostics"] = diags
+		return out
+	}
+
+	runAction := func(cmd string) map[string]any {
+		if cmd == "" {
+			return map[string]any{"ok": false, "output": "no action configured"}
+		}
+		out, err := exec.Command("sh", "-c", cmd).CombinedOutput()
+		return map[string]any{"ok": err == nil, "output": strings.TrimSpace(string(out))}
+	}
+	cors := func(w http.ResponseWriter) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+	}
+	action := func(cmd *string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			cors(w)
+			if r.Method == http.MethodOptions {
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(runAction(*cmd))
+		}
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(status())
+	})
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
+	mux.HandleFunc("/action/sync", action(actSync))
+	mux.HandleFunc("/action/test", action(actTest))
+	fmt.Fprintf(os.Stderr, "ingest-status on %s  GET /status · POST /action/{sync,test} (CORS) ← warehouse %s\n", *addr, *factTable)
+	if err := http.ListenAndServe(*addr, mux); err != nil {
+		fail(err)
+	}
+}
+
+// runWebhookIngest is the PUSH counterpart to `di sync`: a SaaS platform
+// (Shopify/Square/OTA…) POSTs each order in real time; we HMAC-verify it, land the JSON into
+// a staging table, run a transform (upsert into the governed warehouse), and ack.
+// Same governance gate as file/CDC ingest — the platform pushes, we don't poll.
+func runWebhookIngest(argv []string) {
+	fs := flag.NewFlagSet("webhook-ingest", flag.ExitOnError)
+	destDSN := fs.String("dest", envOr("DI_DSN", defaultDSN), "governed warehouse DSN")
+	addr := fs.String("addr", envOr("DI_WEBHOOK_ADDR", ":34210"), "listen address")
+	secret := fs.String("secret", os.Getenv("DI_WEBHOOK_SECRET"), "HMAC-SHA256 secret; deliveries sign the body in X-Signature (empty = accept unsigned)")
+	stage := fs.String("stage", "stg_orders_webhook", "staging table for each delivery")
+	required := fs.String("required", "", "comma-separated stage columns that must be non-empty")
+	after := fs.String("after", "", "SQL file run on dest after landing each delivery (transform → governed)")
+	_ = fs.Parse(argv)
+
+	ctx := context.Background()
+	dest, err := warehouse.Open(ctx, *destDSN, warehouse.Options{})
+	if err != nil {
+		fail(err)
+	}
+	defer dest.Close()
+	afterSQL := ""
+	if *after != "" {
+		b, err := os.ReadFile(*after)
+		if err != nil {
+			fail(err)
+		}
+		afterSQL = string(b)
+	}
+	ensureIngestLog(ctx, dest)
+
+	var mu sync.Mutex
+	var landed int
+	handle := func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			http.Error(w, "read", http.StatusBadRequest)
+			return
+		}
+		// HMAC verification: a bad signature is a security event — reject.
+		if *secret != "" {
+			mac := hmac.New(sha256.New, []byte(*secret))
+			mac.Write(body)
+			want := hex.EncodeToString(mac.Sum(nil))
+			got := r.Header.Get("X-Signature")
+			if !hmac.Equal([]byte(want), []byte(got)) {
+				http.Error(w, "bad signature", http.StatusUnauthorized)
+				fmt.Fprintf(os.Stderr, "← webhook REJECT: bad signature\n")
+				return
+			}
+		}
+		var obj map[string]any
+		if err := json.Unmarshal(body, &obj); err != nil || len(obj) == 0 {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		// Flatten to a single Record with sorted keys → stable stage schema.
+		keys := make([]string, 0, len(obj))
+		for k := range obj {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		schema := connectors.SourceSchema{Name: *stage}
+		rec := connectors.Record{}
+		for _, k := range keys {
+			schema.Fields = append(schema.Fields, connectors.Field{Name: k, Type: "text"})
+			rec[k] = fmt.Sprintf("%v", obj[k])
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		if _, err := dest.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %q`, *stage)); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		plan := ingest.InferMapping(schema, *stage, nil)
+		plan.Required = split(*required)
+		if _, err := ingest.Run(ctx, dest, connectors.Batch{Schema: schema, Rows: []connectors.Record{rec}}, plan); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if afterSQL != "" {
+			if _, err := dest.Exec(ctx, afterSQL); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		landed++
+		logIngest(ctx, dest, "webhook", fmt.Sprintf("order %v", obj["order_id"]), 1, toI64(fmt.Sprintf("%v", obj["order_id"])))
+		fmt.Fprintf(os.Stderr, "← webhook accept #%d: %v\n", landed, obj)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
+	mux.HandleFunc("POST /webhook", handle)
+	note := "unsigned (no secret)"
+	if *secret != "" {
+		note = "HMAC-verified"
+	}
+	fmt.Fprintf(os.Stderr, "order webhook receiver on %s  POST /webhook (%s) → %s → governed\n", *addr, note, *stage)
+	if err := http.ListenAndServe(*addr, mux); err != nil {
+		fail(err)
+	}
+}
+
+// runShadow compiles+runs a query through two model versions and diffs the
+// result — the shadow step before a canary rollout (M21).
+func runShadow(argv []string) {
+	fs := flag.NewFlagSet("shadow", flag.ExitOnError)
+	a := fs.String("a", "models/meridian.yaml", "model A (current)")
+	b := fs.String("b", "", "model B (candidate) — required")
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	metrics := fs.String("metrics", "", "comma-separated metrics (required)")
+	by := fs.String("by", "", "group-by dimensions")
+	grain := fs.String("grain", "", "time grain")
+	_ = fs.Parse(argv)
+	if *b == "" || *metrics == "" {
+		fmt.Fprintln(os.Stderr, "di shadow: -b and -metrics are required")
+		os.Exit(2)
+	}
+	ctx := context.Background()
+	q := semantic.Query{Metrics: split(*metrics), GroupBy: split(*by), TimeGrain: *grain}
+
+	engA, err := engine.New(ctx, *a, *dsn)
+	if err != nil {
+		fail(err)
+	}
+	defer engA.Close()
+	engB, err := engine.New(ctx, *b, *dsn)
+	if err != nil {
+		fail(err)
+	}
+	defer engB.Close()
+
+	ansA, errA := engA.Query(ctx, q)
+	ansB, errB := engB.Query(ctx, q)
+	if errA != nil || errB != nil {
+		fmt.Printf("shadow: A err=%v · B err=%v (DIFFER)\n", errA, errB)
+		os.Exit(1)
+	}
+	da, db := dumpRows(ansA), dumpRows(ansB)
+	if da == db {
+		fmt.Printf("shadow: MATCH (%d rows) — safe to promote B\n", len(ansA.Rows))
+		return
+	}
+	fmt.Printf("shadow: DIFFER — A=%d rows, B=%d rows. Do NOT promote until reconciled.\n", len(ansA.Rows), len(ansB.Rows))
+	os.Exit(1)
+}
+
+func dumpRows(a *engine.Answer) string {
+	var b strings.Builder
+	b.WriteString(strings.Join(a.Columns, "|") + "\n")
+	for _, r := range a.Rows {
+		for i, c := range r {
+			if i > 0 {
+				b.WriteByte('|')
+			}
+			fmt.Fprintf(&b, "%v", c)
+		}
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+func scalar(rows [][]any) string {
+	if len(rows) == 0 || len(rows[0]) == 0 || rows[0][0] == nil {
+		return ""
+	}
+	return fmt.Sprintf("%v", rows[0][0])
+}
+
+func floatEq(a, b string) bool {
+	fa, ea := strconv.ParseFloat(a, 64)
+	fb, eb := strconv.ParseFloat(b, 64)
+	if ea != nil || eb != nil {
+		return a == b
+	}
+	d := fa - fb
+	if d < 0 {
+		d = -d
+	}
+	return d < 0.01
+}
+
+// runNode demonstrates the field-level rule engine: merge the same customer from
+// two sources under conflict/require/alert rules.
+func runNode(_ []string) {
+	n := &nodes.Node{
+		Priority: []string{"crm", "import"}, // crm wins source-priority conflicts
+		Rules: []nodes.Rule{
+			{Field: "email", Kind: nodes.KindConflict, Strategy: "latest"},
+			{Field: "segment", Kind: nodes.KindConflict, Strategy: "source_priority"},
+			{Field: "ltv", Kind: nodes.KindConflict, Strategy: "max"},
+			{Field: "name", Kind: nodes.KindRequire},
+			{Field: "ltv", Kind: nodes.KindAlert, Strategy: "range", Params: map[string]any{"max": 100000.0}},
+			{Field: "email", Kind: nodes.KindAlert, Strategy: "changed"},
+		},
+	}
+	existing := nodes.Source{Name: "crm", Time: "2024-01-01T00:00:00Z", Rec: map[string]string{
+		"name": "Ada Lovelace", "email": "ada@old.com", "segment": "smb", "ltv": "5000",
+	}}
+	incoming := nodes.Source{Name: "import", Time: "2025-01-01T00:00:00Z", Rec: map[string]string{
+		"name": "Ada Lovelace", "email": "ada@new.com", "segment": "enterprise", "ltv": "250000",
+	}}
+
+	merged, events := n.Merge(existing, incoming)
+	fmt.Printf("existing (%s): %v\n", existing.Name, existing.Rec)
+	fmt.Printf("incoming (%s): %v\n", incoming.Name, incoming.Rec)
+	fmt.Println("merged:")
+	for _, k := range []string{"name", "email", "segment", "ltv"} {
+		fmt.Printf("  %-8s = %s\n", k, merged[k])
+	}
+	fmt.Println("events:")
+	for _, e := range events {
+		fmt.Printf("  [%s] %s/%s: %s\n", e.Severity, e.Field, e.Rule, e.Message)
+	}
+}
+
+// newFlowEngine loads workflows from FILES (DI_FLOWS_DIR) and resolves their
+// `ingest` sources from the sources manifest (DI_SOURCES). The platform binary
+// carries NO domain flow logic — flows are data supplied by the example/customer.
+func newFlowEngine(ctx context.Context, dsn string) (*flow.Engine, *warehouse.Warehouse) {
+	wh, err := warehouse.Open(ctx, dsn, warehouse.Options{})
+	if err != nil {
+		fail(err)
+	}
+	e := flow.NewEngine(wh)
+	sourcesPath := envOr("DI_SOURCES", "examples/meridian/sources.yaml")
+	deps := flow.Deps{ResolveSource: func(name string) (connectors.Source, error) {
+		man, err := connectors.LoadManifest(sourcesPath)
+		if err != nil {
+			return nil, err
+		}
+		return man.BuildByName(name)
+	}}
+	flows, err := flow.LoadDir(envOr("DI_FLOWS_DIR", "examples/meridian/flows"), deps)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: load flows: %v\n", err)
+	}
+	for name, steps := range flows {
+		e.Register(name, steps)
+	}
+	return e, wh
+}
+
+func runFlow(argv []string) {
+	if len(argv) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: di flow <run|approve|reject|rollback|list|show> ...")
+		os.Exit(2)
+	}
+	ctx := context.Background()
+	sub, rest := argv[0], argv[1:]
+
+	switch sub {
+	case "run":
+		fs := flag.NewFlagSet("flow run", flag.ExitOnError)
+		dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+		_ = fs.Parse(rest)
+		e, wh := newFlowEngine(ctx, *dsn)
+		defer wh.Close()
+		name := strings.TrimSpace(strings.Join(fs.Args(), " "))
+		if name == "" {
+			fmt.Fprintf(os.Stderr, "di flow run <name>  (loaded flows: %s)\n", strings.Join(e.Names(), ", "))
+			os.Exit(2)
+		}
+		run, err := e.Start(ctx, name, map[string]any{})
+		if err != nil {
+			fail(err)
+		}
+		printRun(run)
+	case "approve", "reject", "rollback", "show":
+		if len(rest) < 1 {
+			fmt.Fprintf(os.Stderr, "di flow %s <run-id>\n", sub)
+			os.Exit(2)
+		}
+		e, wh := newFlowEngine(ctx, envOr("DI_DSN", defaultDSN))
+		defer wh.Close()
+		var run *flow.Run
+		var err error
+		switch sub {
+		case "approve":
+			run, err = e.Approve(ctx, rest[0])
+		case "reject":
+			run, err = e.Reject(ctx, rest[0])
+		case "rollback":
+			run, err = e.Rollback(ctx, rest[0])
+		case "show":
+			run, err = e.Get(ctx, rest[0])
+		}
+		if err != nil {
+			fail(err)
+		}
+		printRun(run)
+	case "list":
+		e, wh := newFlowEngine(ctx, envOr("DI_DSN", defaultDSN))
+		defer wh.Close()
+		runs, err := e.List(ctx)
+		if err != nil {
+			fail(err)
+		}
+		for _, r := range runs {
+			fmt.Printf("%-24s %-16s %s\n", r.ID, r.Flow, r.Status)
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "unknown flow subcommand %q\n", sub)
+		os.Exit(2)
+	}
+}
+
+func printRun(r *flow.Run) {
+	fmt.Printf("run %s  flow=%s  status=%s  cursor=%d\n", r.ID, r.Flow, r.Status, r.Cursor)
+	for k, v := range r.State {
+		fmt.Printf("  state.%s = %v\n", k, v)
+	}
+	for _, s := range r.Steps {
+		info := ""
+		if s.Info != "" {
+			info = "  (" + s.Info + ")"
+		}
+		fmt.Printf("  [%s] %s%s\n", s.Status, s.Name, info)
+	}
+}
+
+func runMCP(argv []string) {
+	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
+	model := fs.String("model", "models/meridian.yaml", "semantic model YAML")
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	httpAddr := fs.String("http", "", "if set, serve over HTTP with bearer auth (e.g. :41955) instead of stdio")
+	role := fs.String("role", envOr("DI_ROLE", "analyst"), "default role for local stdio (no token)")
+	rps := fs.Float64("rps", 0, "per-principal rate limit (0 = off)")
+	oidc := fs.Bool("oidc", false, "verify real JWTs via DI_OIDC_* (issuer/audience/JWKS or pubkey) instead of demo tokens")
+	_ = fs.Parse(argv)
+
+	ctx := context.Background()
+	eng, err := engine.New(ctx, *model, *dsn)
+	if err != nil {
+		fail(err)
+	}
+	defer eng.Close()
+
+	// NL grounding engine for the `ground` tool — the same engine the REST
+	// /v1/ground endpoint uses (retrieval reused, not reimplemented).
+	idxDir, _ := os.MkdirTemp("", "di-mcp-")
+	defer os.RemoveAll(idxDir)
+	gr, gerr := grounding.New(ctx, eng.Model, filepath.Join(idxDir, "idx.db"))
+	if gerr != nil {
+		fail(gerr)
+	}
+	defer gr.Close()
+	if bank, berr := grounding.LoadExemplars(ctx, "models/exemplars.yaml"); berr == nil {
+		gr.WithExemplars(bank)
+	}
+
+	store, reg, closeBrief := briefParts(eng)
+	defer closeBrief()
+
+	opts := &mcpserver.Options{
+		Default: mcpserver.Principal{User: "local", Role: *role, Scopes: []string{"metrics:read", "data:write"}},
+		RPS:     *rps, Burst: 5,
+		ChecksPath: envOr("DI_CHECKS", "examples/meridian/conflicts.yaml"),
+		Grounder:   gr,
+		Corpus:     store,
+		Registry:   reg,
+	}
+
+	if *httpAddr != "" {
+		// Remote: streamable HTTP behind bearer-token auth (per-user identity).
+		verifier, note := mcpVerifier(*oidc)
+		handler := mcpsdk.NewStreamableHTTPHandler(
+			func(*http.Request) *mcpsdk.Server { return mcpserver.NewServer(eng, opts) }, nil)
+		authed := auth.RequireBearerToken(verifier,
+			&auth.RequireBearerTokenOptions{Scopes: []string{"metrics:read"}})(handler)
+		// Continue any trace the client carried in (W3C traceparent header), so
+		// server-side query spans nest under the caller's distributed trace.
+		traced := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			authed.ServeHTTP(w, r.WithContext(obs.ExtractHTTP(r.Context(), r.Header)))
+		})
+		fmt.Fprintf(os.Stderr, "safesqlproxy MCP server on http %s (%s)\n", *httpAddr, note)
+		if err := http.ListenAndServe(*httpAddr, traced); err != nil {
+			fail(err)
+		}
+		return
+	}
+
+	srv := mcpserver.NewServer(eng, opts)
+	fmt.Fprintf(os.Stderr, "safesqlproxy MCP server on stdio (tools: %s)\n", strings.Join(mcpserver.ToolNames, ", "))
+	if err := srv.Run(ctx, &mcpsdk.StdioTransport{}); err != nil {
+		fail(err)
+	}
+}
+
+// mcpVerifier picks the token verifier: a real OIDC/JWT verifier when -oidc is
+// set (config from DI_OIDC_ISSUER / DI_OIDC_AUDIENCE / DI_OIDC_JWKS|DI_OIDC_PUBKEY),
+// else the demo verifier.
+func mcpVerifier(useOIDC bool) (auth.TokenVerifier, string) {
+	if !useOIDC {
+		return mcpserver.DemoVerifier("safesqlproxy"), "demo bearer auth; tokens: analyst-/finance-/admin-token"
+	}
+	cfg := mcpserver.OIDCConfig{
+		Issuer:   os.Getenv("DI_OIDC_ISSUER"),
+		Audience: envOr("DI_OIDC_AUDIENCE", "safesqlproxy"),
+		JWKSURL:  os.Getenv("DI_OIDC_JWKS"),
+		KeyID:    os.Getenv("DI_OIDC_KID"),
+	}
+	if p := os.Getenv("DI_OIDC_PUBKEY"); p != "" {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			fail(err)
+		}
+		cfg.PublicKeyPEM = b
+	}
+	o, err := mcpserver.NewOIDC(cfg)
+	if err != nil {
+		fail(err)
+	}
+	src := cfg.JWKSURL
+	if src == "" {
+		src = "pubkey:" + os.Getenv("DI_OIDC_PUBKEY")
+	}
+	return o.Verifier(), fmt.Sprintf("OIDC: iss=%q aud=%q keys=%s", cfg.Issuer, cfg.Audience, src)
+}
+
+// runToken is the local dev issuer (a real IdP owns this in production):
+//
+//	di token gen-key -dir testdata/oidc           # RSA key + JWKS
+//	di token mint -key testdata/oidc/priv.pem ...  # signed RS256 JWT
+func runToken(argv []string) {
+	if len(argv) == 0 {
+		fmt.Fprintln(os.Stderr, "di token <gen-key|mint> ...")
+		os.Exit(2)
+	}
+	switch argv[0] {
+	case "gen-key":
+		fs := flag.NewFlagSet("gen-key", flag.ExitOnError)
+		dir := fs.String("dir", "testdata/oidc", "output directory for priv.pem / pub.pem / jwks.json")
+		kid := fs.String("kid", "k1", "key id")
+		bits := fs.Int("bits", 2048, "RSA key size")
+		_ = fs.Parse(argv[1:])
+		priv, err := mcpserver.GenerateKey(*bits)
+		if err != nil {
+			fail(err)
+		}
+		if err := os.MkdirAll(*dir, 0o755); err != nil {
+			fail(err)
+		}
+		pubPEM, err := mcpserver.MarshalPublicKeyPEM(&priv.PublicKey)
+		if err != nil {
+			fail(err)
+		}
+		jwks, err := mcpserver.JWKSJSON(*kid, &priv.PublicKey)
+		if err != nil {
+			fail(err)
+		}
+		writeFile(filepath.Join(*dir, "priv.pem"), mcpserver.MarshalPrivateKeyPEM(priv))
+		writeFile(filepath.Join(*dir, "pub.pem"), pubPEM)
+		writeFile(filepath.Join(*dir, "jwks.json"), jwks)
+		fmt.Printf("wrote %s/{priv.pem,pub.pem,jwks.json} (kid=%s)\n", *dir, *kid)
+
+	case "mint":
+		fs := flag.NewFlagSet("mint", flag.ExitOnError)
+		keyPath := fs.String("key", "testdata/oidc/priv.pem", "signing private key PEM")
+		kid := fs.String("kid", "k1", "key id (must match JWKS)")
+		iss := fs.String("iss", "https://idp.local/di", "issuer")
+		aud := fs.String("aud", "safesqlproxy", "audience (the MCP server)")
+		sub := fs.String("sub", "alice", "subject (user id)")
+		roleC := fs.String("role", "finance", "role claim")
+		tenant := fs.String("tenant", "acme", "tenant claim")
+		region := fs.String("region", "", "region claim (for region-scoped roles, e.g. manager)")
+		scopes := fs.String("scopes", "metrics:read", "space- or comma-separated scopes")
+		ttl := fs.Duration("ttl", time.Hour, "token lifetime")
+		_ = fs.Parse(argv[1:])
+		pemBytes, err := os.ReadFile(*keyPath)
+		if err != nil {
+			fail(err)
+		}
+		priv, err := mcpserver.ParsePrivateKeyPEM(pemBytes)
+		if err != nil {
+			fail(err)
+		}
+		now := time.Now()
+		claims := map[string]any{
+			"iss": *iss, "sub": *sub, "aud": *aud, "role": *roleC, "tenant": *tenant, "region": *region,
+			"scope": strings.Join(strings.FieldsFunc(*scopes, func(r rune) bool { return r == ',' || r == ' ' }), " "),
+			"iat":   now.Unix(), "nbf": now.Add(-time.Minute).Unix(), "exp": now.Add(*ttl).Unix(),
+		}
+		tok, err := mcpserver.SignJWT(priv, *kid, claims)
+		if err != nil {
+			fail(err)
+		}
+		fmt.Println(tok)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown token subcommand %q (gen-key|mint)\n", argv[0])
+		os.Exit(2)
+	}
+}
+
+func writeFile(path string, b []byte) {
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		fail(err)
+	}
+}
+
+// openWriteback builds the write-back engine over the warehouse + allowlist.
+func openWriteback(ctx context.Context, model, dsn, schemaPath string) (*engine.Engine, *writeback.Engine) {
+	eng, err := engine.New(ctx, model, dsn)
+	if err != nil {
+		fail(err)
+	}
+	sch, err := writeback.LoadSchema(schemaPath)
+	if err != nil {
+		fail(err)
+	}
+	return eng, &writeback.Engine{WH: eng.WH, Schema: sch, ModelPath: model}
+}
+
+// runPropose: NL → typed change proposal (generated, validated, dry-run, persisted
+// pending). Nothing is applied — it must be approved by a different principal.
+func runPropose(argv []string) {
+	fs := flag.NewFlagSet("propose", flag.ExitOnError)
+	model := fs.String("model", "models/meridian.yaml", "semantic model YAML")
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	schemaPath := fs.String("writeback", "models/writeback.yaml", "write-back allowlist YAML")
+	role := fs.String("role", "analyst", "proposer role")
+	_ = fs.Parse(argv)
+	question := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if question == "" {
+		fmt.Fprintln(os.Stderr, `di propose "mark order 1001 as refunded"`)
+		os.Exit(2)
+	}
+	ctx := context.Background()
+	eng, wb := openWriteback(ctx, *model, *dsn, *schemaPath)
+	defer eng.Close()
+
+	gen, err := writeback.NewGenerator(wb.Schema)
+	if err != nil {
+		fail(fmt.Errorf("propose needs an LLM (set LLM_*): %w", err))
+	}
+	catalog := metricCatalog(eng)
+	prop, err := gen.Generate(ctx, question, catalog)
+	if err != nil {
+		fail(err)
+	}
+	saved, err := wb.Propose(ctx, writeback.Principal{User: "cli", Role: *role}, prop)
+	if err != nil {
+		fail(err)
+	}
+	printProposal(saved)
+	fmt.Fprintf(os.Stderr, "\nproposed %s (pending). Approve with: di approve -role <approver> %s\n", saved.ID, saved.ID)
+}
+
+func runProposals(argv []string) {
+	fs := flag.NewFlagSet("proposals", flag.ExitOnError)
+	model := fs.String("model", "models/meridian.yaml", "semantic model YAML")
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	schemaPath := fs.String("writeback", "models/writeback.yaml", "write-back allowlist YAML")
+	_ = fs.Parse(argv)
+	ctx := context.Background()
+	eng, wb := openWriteback(ctx, *model, *dsn, *schemaPath)
+	defer eng.Close()
+
+	if id := strings.TrimSpace(strings.Join(fs.Args(), " ")); id != "" {
+		prop, err := wb.Get(ctx, id)
+		if err != nil {
+			fail(err)
+		}
+		printProposal(prop)
+		return
+	}
+	list, err := wb.List(ctx, 50)
+	if err != nil {
+		fail(err)
+	}
+	fmt.Printf("%-22s %-7s %-11s %-22s %s\n", "ID", "KIND", "STATUS", "PROPOSER", "SUMMARY")
+	for _, p := range list {
+		fmt.Printf("%-22s %-7s %-11s %-22s %s\n", p.ID, p.Kind, p.Status, p.Proposer, proposalSummary(p))
+	}
+}
+
+func runWriteDecision(action string, argv []string) {
+	fs := flag.NewFlagSet(action, flag.ExitOnError)
+	model := fs.String("model", "models/meridian.yaml", "semantic model YAML")
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	schemaPath := fs.String("writeback", "models/writeback.yaml", "write-back allowlist YAML")
+	role := fs.String("role", "admin", "approver role")
+	_ = fs.Parse(argv)
+	id := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if id == "" {
+		fmt.Fprintf(os.Stderr, "di %s -role <approver> <proposal-id>\n", action)
+		os.Exit(2)
+	}
+	ctx := context.Background()
+	eng, wb := openWriteback(ctx, *model, *dsn, *schemaPath)
+	defer eng.Close()
+	p := writeback.Principal{User: "cli", Role: *role}
+
+	var prop *writeback.Proposal
+	var err error
+	switch action {
+	case "approve":
+		prop, err = wb.Approve(ctx, p, id)
+	case "reject":
+		prop, err = wb.Reject(ctx, p, id)
+	case "revert":
+		prop, err = wb.Rollback(ctx, p, id)
+	}
+	if err != nil {
+		fail(err)
+	}
+	fmt.Printf("%s → %s\n", action, prop.Status)
+	if prop.Note != "" {
+		fmt.Printf("  %s\n", prop.Note)
+	}
+}
+
+func printProposal(p *writeback.Proposal) {
+	fmt.Printf("proposal %s  [%s · %s]\n", p.ID, p.Kind, p.Status)
+	fmt.Printf("  request : %s\n", p.Question)
+	if p.Rationale != "" {
+		fmt.Printf("  rationale: %s\n", p.Rationale)
+	}
+	if p.Data != nil {
+		fmt.Printf("  change  : %s %s set=%v where=%v\n", p.Data.Op, p.Data.Table, p.Data.Set, p.Data.Where)
+	}
+	if p.Model != nil {
+		fmt.Printf("  model   : %s %s\n%s\n", p.Model.Kind, p.Model.Name, p.Model.YAML)
+	}
+	if p.Preview != nil {
+		if p.Preview.SQL != "" {
+			fmt.Printf("  sql     : %s  args=%v\n", p.Preview.SQL, p.Preview.Args)
+		}
+		fmt.Printf("  preview : affects %d row(s). %s\n", p.Preview.AffectedRows, p.Preview.Note)
+		for i, r := range p.Preview.Before {
+			if i >= 5 {
+				fmt.Printf("            … (%d more)\n", len(p.Preview.Before)-5)
+				break
+			}
+			fmt.Printf("            before: %v\n", r)
+		}
+	}
+}
+
+func proposalSummary(p *writeback.Proposal) string {
+	if p.Data != nil {
+		n := 0
+		if p.Preview != nil {
+			n = p.Preview.AffectedRows
+		}
+		return fmt.Sprintf("%s %s (%d rows)", p.Data.Op, p.Data.Table, n)
+	}
+	if p.Model != nil {
+		return fmt.Sprintf("model %s %s", p.Model.Kind, p.Model.Name)
+	}
+	return p.Question
+}
+
+func metricCatalog(eng *engine.Engine) string {
+	var b strings.Builder
+	for i := range eng.Model.Metrics {
+		m := &eng.Model.Metrics[i]
+		fmt.Fprintf(&b, "- %s: %s\n", m.Name, m.Description)
+	}
+	return b.String()
+}
+
+// runOBO demonstrates on-behalf-of identity propagation to the warehouse:
+//
+//	di obo setup                 # install the Postgres row-security policy on stores
+//	di obo demo -region South    # prove the DB itself scopes a per-user session
+//	di obo chain -token <jwt>    # full chain: verify → RFC 8693 exchange → DB session
+func runOBO(argv []string) {
+	if len(argv) == 0 {
+		fmt.Fprintln(os.Stderr, "di obo <setup|demo|chain> ...")
+		os.Exit(2)
+	}
+	ctx := context.Background()
+	switch argv[0] {
+	case "setup":
+		fs := flag.NewFlagSet("setup", flag.ExitOnError)
+		dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+		file := fs.String("file", "deploy/schema/03_obo_rls.sql", "RLS policy SQL")
+		_ = fs.Parse(argv[1:])
+		wh, err := warehouse.Open(ctx, *dsn, warehouse.Options{})
+		if err != nil {
+			fail(err)
+		}
+		defer wh.Close()
+		sqlBytes, err := os.ReadFile(*file)
+		if err != nil {
+			fail(err)
+		}
+		if _, err := wh.Exec(ctx, string(sqlBytes)); err != nil {
+			fail(err)
+		}
+		fmt.Println("installed warehouse RLS policy (stores_region_isolation, FORCE RLS)")
+
+	case "demo":
+		fs := flag.NewFlagSet("demo", flag.ExitOnError)
+		dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+		region := fs.String("region", "South", "region to scope the session to")
+		_ = fs.Parse(argv[1:])
+		wh, err := warehouse.Open(ctx, *dsn, warehouse.Options{AppRole: "di_app"})
+		if err != nil {
+			fail(err)
+		}
+		defer wh.Close()
+		// A raw cross-region query — NO app-layer filter. Only the DB session
+		// identity decides what comes back, proving warehouse-level enforcement.
+		const raw = `SELECT region, count(*) FROM stores GROUP BY region ORDER BY region`
+		admin, err := wh.QueryAs(ctx, warehouse.Session{User: "admin", Role: "admin"}, raw)
+		if err != nil {
+			fail(err)
+		}
+		mgr, err := wh.QueryAs(ctx, warehouse.Session{User: "mgr", Role: "manager", Region: *region}, raw)
+		if err != nil {
+			fail(err)
+		}
+		fmt.Printf("same SQL %q, only the DB session identity differs:\n", raw)
+		fmt.Printf("  admin (app.region unset) → regions: %v\n", flatten(admin.Rows))
+		fmt.Printf("  manager (app.region=%s)  → regions: %v\n", *region, flatten(mgr.Rows))
+
+	case "chain":
+		fs := flag.NewFlagSet("chain", flag.ExitOnError)
+		token := fs.String("token", "", "caller JWT (from `di token mint`)")
+		key := fs.String("key", "testdata/oidc/priv.pem", "warehouse-token signing key")
+		kid := fs.String("kid", "k1", "key id")
+		whAud := fs.String("warehouse-aud", "meridian-warehouse", "downstream warehouse audience")
+		dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+		_ = fs.Parse(argv[1:])
+		if *token == "" {
+			fmt.Fprintln(os.Stderr, "di obo chain -token <jwt>")
+			os.Exit(2)
+		}
+		// 1) Verify the caller token (same verifier the MCP server uses).
+		verifier, _ := mcpVerifier(true)
+		ti, err := verifier(ctx, *token, nil)
+		if err != nil {
+			fail(fmt.Errorf("verify caller token: %w", err))
+		}
+		fmt.Printf("1) verified caller: sub=%s role=%v region=%v\n", ti.UserID, ti.Extra["role"], ti.Extra["region"])
+		// 2) RFC 8693 exchange → a warehouse-audience token + identity.
+		priv, err := mcpserver.ParsePrivateKeyPEM(mustRead(*key))
+		if err != nil {
+			fail(err)
+		}
+		whTok, id, err := mcpserver.ExchangeToken(priv, *kid, "safesqlproxy-mcp", *whAud, ti, 5*time.Minute)
+		if err != nil {
+			fail(err)
+		}
+		fmt.Printf("2) exchanged (RFC 8693) → warehouse token aud=%q sub=%s region=%s (%d-char JWT)\n", *whAud, id.User, id.Region, len(whTok))
+		// 3) Open the DB session AS that identity and run a raw cross-region query.
+		wh, err := warehouse.Open(ctx, *dsn, warehouse.Options{AppRole: "di_app"})
+		if err != nil {
+			fail(err)
+		}
+		defer wh.Close()
+		res, err := wh.QueryAs(ctx, warehouse.Session{User: id.User, Role: id.Role, Tenant: id.Tenant, Region: id.Region},
+			`SELECT region, count(*) FROM stores GROUP BY region ORDER BY region`)
+		if err != nil {
+			fail(err)
+		}
+		fmt.Printf("3) warehouse session (app.region=%q) sees regions: %v\n", id.Region, flatten(res.Rows))
+
+	default:
+		fmt.Fprintf(os.Stderr, "unknown obo subcommand %q (setup|demo|chain)\n", argv[0])
+		os.Exit(2)
+	}
+}
+
+func flatten(rows [][]any) []string {
+	var out []string
+	for _, r := range rows {
+		out = append(out, fmt.Sprintf("%v=%v", r[0], r[len(r)-1]))
+	}
+	return out
+}
+
+func mustRead(path string) []byte {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		fail(err)
+	}
+	return b
+}
+
+// runSource is the neutral, manifest-driven multi-source connector: it reads any
+// configured source (mysql/mssql/mongo/redis/s3/kafka/csv/xlsx) and can ingest it into
+// the warehouse. The platform knows source TYPES; the manifest supplies the domain.
+//
+//	di source list   -manifest examples/meridian/sources.yaml
+//	di source read   -manifest ... <name>
+//	di source ingest -manifest ... <name> [-table _src_<name>]
+func runSource(argv []string) {
+	if len(argv) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: di source <list|read|ingest> -manifest <f> [name]")
+		os.Exit(2)
+	}
+	sub := argv[0]
+	fs := flag.NewFlagSet("source", flag.ExitOnError)
+	manifest := fs.String("manifest", "examples/meridian/sources.yaml", "sources manifest YAML")
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN (for ingest)")
+	table := fs.String("table", "", "target table for ingest (default _src_<name>)")
+	limit := fs.Int("limit", 10, "rows to print for read")
+	_ = fs.Parse(argv[1:])
+	name := strings.TrimSpace(strings.Join(fs.Args(), " "))
+
+	man, err := connectors.LoadManifest(*manifest)
+	if err != nil {
+		fail(err)
+	}
+	ctx := context.Background()
+
+	if sub == "list" {
+		fmt.Printf("%-18s %-10s\n", "NAME", "TYPE")
+		for _, s := range man.Sources {
+			fmt.Printf("%-18s %-10s\n", s.Name, s.Type)
+		}
+		return
+	}
+	if name == "" {
+		fmt.Fprintf(os.Stderr, "di source %s needs a source name (one of: %s)\n", sub, strings.Join(man.Names(), ", "))
+		os.Exit(2)
+	}
+	src, err := man.BuildByName(name)
+	if err != nil {
+		fail(err)
+	}
+	batch, err := src.Read(ctx)
+	if err != nil {
+		fail(err)
+	}
+
+	switch sub {
+	case "read":
+		fmt.Fprintf(os.Stderr, "-- %s: %d rows, fields=%d\n", name, len(batch.Rows), len(batch.Schema.Fields))
+		printRecords(batch, *limit)
+	case "ingest":
+		tbl := *table
+		if tbl == "" {
+			tbl = "_src_" + name
+		}
+		wh, err := warehouse.Open(ctx, *dsn, warehouse.Options{})
+		if err != nil {
+			fail(err)
+		}
+		defer wh.Close()
+		spec := man.Spec(name)
+		n, err := connectors.StageWithKey(ctx, wh, tbl, batch, spec.PrimaryKey)
+		if err != nil {
+			fail(err)
+		}
+		fmt.Printf("ingested %d rows from source %q (%s) into %s\n", n, name, spec.Type, tbl)
+		if h, ok := src.(*connectors.HTTPSource); ok && h.Truncated != "" {
+			// A capped pull presented as a complete one is the same lie as a
+			// stopped feed: the totals are simply short, and nothing says so.
+			fmt.Fprintf(os.Stderr, "-- INCOMPLETE: %s\n", h.Truncated)
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "unknown source subcommand %q (list|read|ingest)\n", sub)
+		os.Exit(2)
+	}
+}
+
+// printRecords prints up to n records as a table over the union of fields.
+func printRecords(b connectors.Batch, n int) {
+	cols := make([]string, 0, len(b.Schema.Fields))
+	for _, f := range b.Schema.Fields {
+		cols = append(cols, f.Name)
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(w, strings.Join(cols, "\t"))
+	for i, r := range b.Rows {
+		if i >= n {
+			break
+		}
+		cells := make([]string, len(cols))
+		for j, c := range cols {
+			cells[j] = truncCell(r[c], 28)
+		}
+		fmt.Fprintln(w, strings.Join(cells, "\t"))
+	}
+	w.Flush()
+}
+
+func truncCell(s string, n int) string {
+	if len(s) > n {
+		return s[:n-1] + "…"
+	}
+	return s
+}
+
+// runWebhook starts the real-time push receiver: an external system (Twenty CRM)
+// POSTs change events here; each is signature-checked and recorded to _crm_events.
+func runWebhook(argv []string) {
+	fs := flag.NewFlagSet("webhook", flag.ExitOnError)
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	addr := fs.String("addr", envOr("DI_WEBHOOK_ADDR", ":34200"), "listen address")
+	secret := fs.String("secret", os.Getenv("DI_WEBHOOK_SECRET"), "HMAC secret to verify deliveries")
+	_ = fs.Parse(argv)
+
+	ctx := context.Background()
+	wh, err := warehouse.Open(ctx, *dsn, warehouse.Options{})
+	if err != nil {
+		fail(err)
+	}
+	defer wh.Close()
+
+	srv := &connectors.WebhookServer{WH: wh, Secret: *secret, OnEvent: func(e connectors.WebhookEvent) {
+		fmt.Fprintf(os.Stderr, "← webhook: %s %s id=%s verified=%s\n", e.Event, e.Object, e.RecordID, e.Verified)
+	}}
+	secNote := "unsigned (no secret)"
+	if *secret != "" {
+		secNote = "HMAC-verified"
+	}
+	fmt.Fprintf(os.Stderr, "CRM webhook receiver on %s  POST /webhook (%s) → _crm_events\n", *addr, secNote)
+	if err := http.ListenAndServe(*addr, srv.Handler()); err != nil {
+		fail(err)
+	}
+}
+
+// runCRM syncs contacts from a real Twenty CRM into the warehouse and joins them
+// to the existing Meridian customers on email — a real "CRM client" connector.
+func runCRM(argv []string) {
+	fs := flag.NewFlagSet("crm", flag.ExitOnError)
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	base := fs.String("url", envOr("TWENTY_URL", "http://localhost:34100"), "Twenty base URL")
+	key := fs.String("key", os.Getenv("TWENTY_API_KEY"), "Twenty API key (or TWENTY_API_KEY)")
+	since := fs.String("since", "", "incremental: only sync People updated after this ISO8601 cursor")
+	join := fs.Bool("join", true, "after sync, join CRM people to Meridian customers on email")
+	_ = fs.Parse(argv)
+	if *key == "" {
+		fmt.Fprintln(os.Stderr, "di crm: set TWENTY_API_KEY (or -key)")
+		os.Exit(2)
+	}
+	ctx := context.Background()
+	wh, err := warehouse.Open(ctx, *dsn, warehouse.Options{})
+	if err != nil {
+		fail(err)
+	}
+	defer wh.Close()
+	src := &connectors.TwentyCRM{BaseURL: *base, APIKey: *key}
+
+	var rows []connectors.Record
+	if *since != "" {
+		rows, err = src.Poll(ctx, *since)
+	} else {
+		var b connectors.Batch
+		b, err = src.Read(ctx)
+		rows = b.Rows
+	}
+	if err != nil {
+		fail(err)
+	}
+
+	if _, err := wh.Exec(ctx, `CREATE TABLE IF NOT EXISTS _crm_people (
+		crm_id text PRIMARY KEY, name text, first_name text, last_name text,
+		email text, job_title text, city text, updated_at text, synced_at timestamptz DEFAULT now())`); err != nil {
+		fail(err)
+	}
+	for _, r := range rows {
+		if _, err := wh.Exec(ctx, `INSERT INTO _crm_people (crm_id,name,first_name,last_name,email,job_title,city,updated_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+			ON CONFLICT (crm_id) DO UPDATE SET name=$2,first_name=$3,last_name=$4,email=$5,job_title=$6,city=$7,updated_at=$8,synced_at=now()`,
+			r["crm_id"], r["name"], r["first_name"], r["last_name"], r["email"], r["job_title"], r["city"], r["updated_at"]); err != nil {
+			fail(err)
+		}
+	}
+	fmt.Printf("synced %d CRM people from %s into _crm_people\n", len(rows), *base)
+
+	if !*join {
+		return
+	}
+	// The payoff: CRM ⋈ warehouse on email. The CRM was seeded from Meridian
+	// customers, so this enriches the warehouse's customers with CRM attributes.
+	res, err := wh.Query(ctx, `
+		SELECT c.customer_id, c.customer_name, c.segment, cp.job_title AS crm_segment, cp.crm_id
+		FROM customers c JOIN _crm_people cp ON lower(c.email) = lower(cp.email)
+		ORDER BY c.customer_id LIMIT 20`)
+	if err != nil {
+		fail(err)
+	}
+	cnt, _ := wh.Query(ctx, `SELECT count(*) FROM customers c JOIN _crm_people cp ON lower(c.email)=lower(cp.email)`)
+	fmt.Printf("\n-- enrichment join: Meridian customers ⋈ CRM people on email (%s matched) --\n", scalar(cnt.Rows))
+	printResult(res.Columns, res.Rows)
+}
+
+func runIngest(argv []string) {
+	fs := flag.NewFlagSet("ingest", flag.ExitOnError)
+	csvPath := fs.String("csv", "", "path to a CSV file (required)")
+	table := fs.String("table", "", "target table name (required)")
+	fields := fs.String("fields", "", "target columns to map to (optional; default = cleaned CSV headers)")
+	required := fs.String("required", "", "comma-separated target columns that must be non-empty")
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	_ = fs.Parse(argv)
+	if *csvPath == "" || *table == "" {
+		fmt.Fprintln(os.Stderr, "di ingest: -csv and -table are required")
+		os.Exit(2)
+	}
+
+	ctx := context.Background()
+	src := &connectors.CSVSource{Path: *csvPath}
+	schema, err := src.Discover(ctx)
+	if err != nil {
+		fail(err)
+	}
+	fmt.Fprintf(os.Stderr, "-- discovered %d columns:\n", len(schema.Fields))
+	for _, f := range schema.Fields {
+		fmt.Fprintf(os.Stderr, "   %-16s %s\n", f.Name, f.Type)
+	}
+
+	plan := ingest.InferMapping(schema, *table, split(*fields))
+	plan.Required = split(*required)
+	fmt.Fprintln(os.Stderr, "-- mapping (source → target):")
+	for _, fm := range plan.Fields {
+		fmt.Fprintf(os.Stderr, "   %-16s → %-16s [%s]\n", fm.Source, fm.Target, fm.Type)
+	}
+
+	wh, err := warehouse.Open(ctx, *dsn, warehouse.Options{})
+	if err != nil {
+		fail(err)
+	}
+	defer wh.Close()
+
+	batch, err := src.Read(ctx)
+	if err != nil {
+		fail(err)
+	}
+	rep, err := ingest.Run(ctx, wh, batch, plan)
+	if err != nil {
+		fail(err)
+	}
+	fmt.Printf("ingested into %q: read=%d landed=%d skipped=%d\n", rep.Table, rep.RowsRead, rep.RowsLanded, rep.RowsSkipped)
+	for _, d := range rep.Diff {
+		fmt.Printf("  diff: %s\n", d)
+	}
+	for _, e := range rep.Errors {
+		fmt.Printf("  check: %s\n", e)
+	}
+}
+
+func runAsk(argv []string) {
+	fs := flag.NewFlagSet("ask", flag.ExitOnError)
+	model := fs.String("model", "models/meridian.yaml", "semantic model YAML")
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	role := fs.String("role", "analyst", "caller role (governance)")
+	useCritic := fs.Bool("critic", true, "run the plan-query-critique loop: self-verify + bounded revise")
+	retries := fs.Int("retries", 2, "max critic-driven revisions before graceful degradation")
+	_ = fs.Parse(argv)
+	question := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if question == "" {
+		fmt.Fprintln(os.Stderr, `di ask: provide a question, e.g. di ask "net revenue by region"`)
+		os.Exit(2)
+	}
+
+	ctx := context.Background()
+	eng, err := engine.New(ctx, *model, *dsn)
+	if err != nil {
+		fail(err)
+	}
+	defer eng.Close()
+
+	dir, _ := os.MkdirTemp("", "di-ground-")
+	defer os.RemoveAll(dir)
+	g, err := grounding.New(ctx, eng.Model, filepath.Join(dir, "idx.db"))
+	if err != nil {
+		fail(err)
+	}
+	defer g.Close()
+	if bank, err := grounding.LoadExemplars(ctx, "models/exemplars.yaml"); err == nil {
+		g.WithExemplars(bank)
+	}
+	fmt.Fprintf(os.Stderr, "-- grounding=%s\n", g.Mode())
+	principal := governance.Principal{User: "cli", Role: *role}
+
+	if *useCritic {
+		runAskWithCritic(ctx, eng, g, principal, question, *retries)
+		return
+	}
+
+	q, retrieved, clarify, err := g.Ground(ctx, question)
+	if err != nil {
+		fail(err)
+	}
+	// Receipt: which metrics were retrieved (pruned context) — auditable.
+	var rnames []string
+	for _, r := range retrieved {
+		rnames = append(rnames, r.Name)
+	}
+	fmt.Fprintf(os.Stderr, "-- retrieved top-%d=%v\n", len(rnames), rnames)
+
+	if clarify != nil {
+		fmt.Printf("clarify: %s\n  candidates: %s\n", clarify.Question, strings.Join(clarify.Candidates, ", "))
+		return
+	}
+	fmt.Fprintf(os.Stderr, "-- grounded → metrics=%v group_by=%v grain=%q\n", q.Metrics, q.GroupBy, q.TimeGrain)
+
+	ans, err := governance.Query(ctx, eng, q, principal, governance.DefaultPolicy())
+	if err != nil {
+		fail(err)
+	}
+	printAnswer(ans)
+}
+
+// runAskWithCritic runs the plan-query-critique loop: ground →
+// govern+execute → critique (rule, then LLM) → revise or answer, bounded.
+func runAskWithCritic(ctx context.Context, eng *engine.Engine, g *grounding.Grounder, p governance.Principal, question string, retries int) {
+	chain := critic.Chain{Rule: critic.RuleCritic{}}
+	if lc, err := critic.NewLLMCritic(); err == nil {
+		chain.LLM = lc
+	}
+	loop := &critic.Loop{Gr: g, Eng: eng, Pol: governance.DefaultPolicy(), Critic: chain, MaxRetries: retries}
+
+	res, err := loop.Resolve(ctx, question, p)
+	if err != nil {
+		fail(err)
+	}
+
+	// Trace: every plan-query-critique cycle, auditable.
+	for _, a := range res.Attempts {
+		v := a.Verdict
+		if a.Feedback != "" {
+			fmt.Fprintf(os.Stderr, "-- attempt %d (revised: %s)\n", a.N, a.Feedback)
+		} else {
+			fmt.Fprintf(os.Stderr, "-- attempt %d\n", a.N)
+		}
+		fmt.Fprintf(os.Stderr, "   plan → metrics=%v group_by=%v grain=%q\n", a.Query.Metrics, a.Query.GroupBy, a.Query.TimeGrain)
+		detail := v.Feedback
+		if detail == "" {
+			detail = strings.Join(v.Reasons, "; ")
+		}
+		fmt.Fprintf(os.Stderr, "   critic[%s] → %s", v.By, v.Decision)
+		if v.Dimension != "" {
+			fmt.Fprintf(os.Stderr, " (%s)", v.Dimension)
+		}
+		if detail != "" {
+			fmt.Fprintf(os.Stderr, ": %s", detail)
+		}
+		fmt.Fprintln(os.Stderr)
+	}
+
+	switch res.Outcome {
+	case "answered":
+		fmt.Fprintf(os.Stderr, "-- outcome: answered after %d attempt(s)\n", len(res.Attempts))
+		printAnswer(res.Answer)
+	case "clarify":
+		fmt.Printf("clarify: %s\n", res.Clarify.Question)
+		if len(res.Clarify.Candidates) > 0 {
+			fmt.Printf("  candidates: %s\n", strings.Join(res.Clarify.Candidates, ", "))
+		}
+	case "refused":
+		fmt.Printf("refused: %s\n", res.Note)
+	case "gave_up":
+		fmt.Printf("could not fully verify (%s). best-effort answer below:\n", res.Note)
+		if res.Answer != nil {
+			printAnswer(res.Answer)
+		}
+	}
+}
+
+// runChat is the conversational session with typed cross-turn memory: each line
+// on stdin is a turn that refines (merge) or replaces (reset) the running state.
+func runChat(argv []string) {
+	fs := flag.NewFlagSet("chat", flag.ExitOnError)
+	model := fs.String("model", "models/meridian.yaml", "semantic model YAML")
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	role := fs.String("role", "analyst", "caller role (governance)")
+	useCritic := fs.Bool("critic", true, "verify each turn with the critic")
+	_ = fs.Parse(argv)
+
+	ctx := context.Background()
+	eng, g := openGrounder(ctx, *model, *dsn)
+	defer eng.Close()
+	defer g.Close()
+
+	sess := convo.New(g, eng, governance.DefaultPolicy(), governance.Principal{User: "cli", Role: *role})
+	if *useCritic {
+		chain := critic.Chain{Rule: critic.RuleCritic{}}
+		if lc, err := critic.NewLLMCritic(); err == nil {
+			chain.LLM = lc
+		}
+		sess.Critic = chain
+	}
+	fmt.Fprintf(os.Stderr, "-- chat (%s) · one question per line, Ctrl-D to end\n", g.Mode())
+
+	sc := bufio.NewScanner(os.Stdin)
+	for sc.Scan() {
+		q := strings.TrimSpace(sc.Text())
+		if q == "" {
+			continue
+		}
+		res, err := sess.Ask(ctx, q)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			continue
+		}
+		switch res.Kind {
+		case "clarify":
+			fmt.Printf("» %s\n  clarify: %s\n", q, res.Clarify.Question)
+		case "refused":
+			fmt.Printf("» %s\n  refused: %s\n", q, res.Note)
+		default:
+			fmt.Printf("» %s  [%s · state: metrics=%v group_by=%v grain=%q where=%d]\n",
+				q, res.Kind, res.State.Metrics, res.State.GroupBy, res.State.TimeGrain, len(res.State.Where))
+			printAnswer(res.Answer)
+		}
+	}
+}
+
+// runChain plans and executes a multi-metric question whose later step filters on
+// an earlier step's result (explicit dependency edges, sub-result caching).
+func runChain(argv []string) {
+	fs := flag.NewFlagSet("chain", flag.ExitOnError)
+	model := fs.String("model", "models/meridian.yaml", "semantic model YAML")
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	role := fs.String("role", "analyst", "caller role (governance)")
+	_ = fs.Parse(argv)
+	question := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if question == "" {
+		fmt.Fprintln(os.Stderr, `di chain "refund total for the top region by revenue"`)
+		os.Exit(2)
+	}
+
+	ctx := context.Background()
+	eng, g := openGrounder(ctx, *model, *dsn)
+	defer eng.Close()
+	defer g.Close()
+	sess := convo.New(g, eng, governance.DefaultPolicy(), governance.Principal{User: "cli", Role: *role})
+
+	res, multi, err := sess.RunChain(ctx, question)
+	if err != nil {
+		fail(err)
+	}
+	if !multi {
+		fmt.Fprintln(os.Stderr, "-- single-step question; use `di ask` instead")
+		r, err := sess.Ask(ctx, question)
+		if err != nil {
+			fail(err)
+		}
+		printAnswer(r.Answer)
+		return
+	}
+	for _, st := range res.Steps {
+		fmt.Fprintf(os.Stderr, "-- step %s: metrics=%v group_by=%v where=%v", st.Step.ID, st.Query.Metrics, st.Query.GroupBy, st.Query.Where)
+		if st.Picked != "" {
+			fmt.Fprintf(os.Stderr, " → picked %s=%q", st.Step.Pick.Dimension, st.Picked)
+		}
+		fmt.Fprintln(os.Stderr)
+	}
+	if res.Note != "" {
+		fmt.Println(res.Note)
+	}
+	if res.Final != nil {
+		printAnswer(res.Final)
+	}
+}
+
+// openGrounder builds an engine + grounder (with exemplars) — shared by ask/chat/chain.
+func openGrounder(ctx context.Context, model, dsn string) (*engine.Engine, *grounding.Grounder) {
+	eng, err := engine.New(ctx, model, dsn)
+	if err != nil {
+		fail(err)
+	}
+	dir, _ := os.MkdirTemp("", "di-ground-")
+	g, err := grounding.New(ctx, eng.Model, filepath.Join(dir, "idx.db"))
+	if err != nil {
+		fail(err)
+	}
+	if bank, err := grounding.LoadExemplars(ctx, "models/exemplars.yaml"); err == nil {
+		g.WithExemplars(bank)
+	}
+	return eng, g
+}
+
+func runQuery(argv []string) {
+	fs := flag.NewFlagSet("query", flag.ExitOnError)
+	model := fs.String("model", "models/meridian.yaml", "semantic model YAML")
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	metrics := fs.String("metrics", "", "comma-separated metrics (required)")
+	by := fs.String("by", "", "comma-separated group-by dimensions")
+	grain := fs.String("grain", "", "time grain (day|month|quarter|year)")
+	limit := fs.Int("limit", 0, "row limit")
+	role := fs.String("role", "analyst", "caller role (governance: RBAC + masking)")
+	region := fs.String("region", "", "caller region attribute (row-level security for role=manager)")
+	tenant := fs.String("tenant", "", "tenant id (per-tenant spend budget)")
+	to := fs.String("to", "", "destination sink: log | json:path | table:name | alert:col:min:max")
+	_ = fs.Parse(argv)
+
+	if *metrics == "" {
+		fmt.Fprintln(os.Stderr, "di query: -metrics is required")
+		os.Exit(2)
+	}
+	ctx := context.Background()
+	eng, err := engine.New(ctx, *model, *dsn)
+	if err != nil {
+		fail(err)
+	}
+	defer eng.Close()
+
+	principal := governance.Principal{User: "cli", Role: *role}
+	if *region != "" || *tenant != "" {
+		principal.Attrs = map[string]string{"region": *region, "tenant": *tenant}
+	}
+	pol := governance.DefaultPolicy()
+	pol.TenantBudgetBytes = envBytes("DI_TENANT_BUDGET_BYTES") // 0 = unlimited
+	ans, err := governance.Query(ctx, eng, semantic.Query{
+		Metrics:   split(*metrics),
+		GroupBy:   split(*by),
+		TimeGrain: *grain,
+		Limit:     *limit,
+	}, principal, pol)
+	if err != nil {
+		fail(err)
+	}
+	printAnswer(ans)
+
+	if *to != "" {
+		sink, err := parseSink(eng.WH, *to)
+		if err != nil {
+			fail(err)
+		}
+		res, err := sink.Write(ctx, ans.Columns, ans.Rows)
+		if err != nil {
+			fail(err)
+		}
+		fmt.Fprintf(os.Stderr, "-- delivered to %s: %+v\n", sink.Name(), res)
+	}
+}
+
+func parseSink(wh *warehouse.Warehouse, spec string) (destinations.Sink, error) {
+	parts := strings.SplitN(spec, ":", 2)
+	switch parts[0] {
+	case "log":
+		return destinations.LogSink{}, nil
+	case "json":
+		if len(parts) < 2 {
+			return nil, fmt.Errorf("json sink needs a path: json:out.jsonl")
+		}
+		return destinations.JSONFileSink{Path: parts[1]}, nil
+	case "table":
+		if len(parts) < 2 {
+			return nil, fmt.Errorf("table sink needs a name: table:foo")
+		}
+		return destinations.TableSink{WH: wh, Table: parts[1]}, nil
+	case "alert":
+		f := strings.Split(spec, ":") // alert:col:min:max
+		if len(f) < 4 {
+			return nil, fmt.Errorf("alert sink: alert:col:min:max")
+		}
+		mn, _ := strconv.ParseFloat(f[2], 64)
+		mx, _ := strconv.ParseFloat(f[3], 64)
+		return destinations.AlertSink{Column: f[1], Min: mn, Max: mx, HasMin: true, HasMax: true}, nil
+	case "es":
+		if len(parts) < 2 {
+			return nil, fmt.Errorf("es sink needs an index: es:my_index")
+		}
+		return destinations.ESSink{URL: os.Getenv("DI_ES_URL"), Index: parts[1]}, nil // URL empty = dry-run
+	case "snowflake":
+		if len(parts) < 2 {
+			return nil, fmt.Errorf("snowflake sink needs a table: snowflake:db.schema.table")
+		}
+		return destinations.SnowflakeSink{Table: parts[1]}, nil
+	default:
+		return nil, fmt.Errorf("unknown sink %q", parts[0])
+	}
+}
+
+func printAnswer(ans *engine.Answer) {
+	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(w, strings.Join(ans.Columns, "\t"))
+	for _, row := range ans.Rows {
+		cells := make([]string, len(row))
+		for i, c := range row {
+			cells[i] = fmt.Sprintf("%v", c)
+		}
+		fmt.Fprintln(w, strings.Join(cells, "\t"))
+	}
+	w.Flush()
+	if ans.TraceID != "" {
+		fmt.Fprintf(os.Stderr, "\n-- trace=%s  compile=%dms execute=%dms rows=%d\n", ans.TraceID, ans.CompileMs, ans.ExecMs, len(ans.Rows))
+	}
+	fmt.Fprintf(os.Stderr, "-- compiled SQL --\n%s\n", ans.SQL)
+}
+
+// printResult renders a raw column/row result as a table.
+func printResult(cols []string, rows [][]any) {
+	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(w, strings.Join(cols, "\t"))
+	for _, row := range rows {
+		cells := make([]string, len(row))
+		for i, c := range row {
+			cells[i] = fmt.Sprintf("%v", c)
+		}
+		fmt.Fprintln(w, strings.Join(cells, "\t"))
+	}
+	w.Flush()
+}
+
+func split(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func envOr(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
+
+// envBytes reads a byte budget from the environment, 0 (unlimited) when unset.
+func envBytes(k string) int64 {
+	v := os.Getenv(k)
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+func fail(err error) {
+	fmt.Fprintln(os.Stderr, "di:", err)
+	os.Exit(1)
+}
+
+// runReport renders the handover document for an engagement.
+//
+// Modelling someone's warehouse is otherwise unfalsifiable work: you deliver a
+// YAML file and a dashboard, and nobody — including you — can say whether the
+// numbers are right. Both gates that answer that already run in CI; nothing
+// rendered them as one document for the person paying for it.
+// runPackage turns a finished engagement into something that can be handed over.
+func runPackage(argv []string) {
+	fs := flag.NewFlagSet("package", flag.ExitOnError)
+	engFile := fs.String("engagement", "", "engagement.yaml (default: found by walking up)")
+	out := fs.String("out", "", "archive path (default: <customer>.tar.gz beside the engagement)")
+	_ = fs.Parse(argv)
+
+	path, err := engagement.Find(*engFile)
+	if err != nil {
+		fail(err)
+	}
+	e, err := engagement.Load(path)
+	if err != nil {
+		fail(err)
+	}
+	if *out == "" {
+		*out = filepath.Join(e.Dir(), slug(e.Customer)+".tar.gz")
+	}
+	p, err := handover.Build(e, *out)
+	if err != nil {
+		fail(err)
+	}
+	fmt.Print(p.WriteMarkdown())
+	fmt.Fprintf(os.Stderr, "\n-- wrote %s: %d file(s)\n", *out, len(p.Files))
+	if len(p.Missing) > 0 {
+		// Exit non-zero: a handover missing its runbook or its acceptance
+		// report is incomplete, and a command that says so only in prose gets
+		// run from a script that ignores prose.
+		fmt.Fprintf(os.Stderr, "-- INCOMPLETE: %d artefact(s) were never generated\n", len(p.Missing))
+		os.Exit(1)
+	}
+}
+
+// slug makes a filename out of a customer name, keeping CJK.
+func slug(s string) string {
+	out := connectors.FoldIdent(s)
+	if out == "" {
+		return "engagement"
+	}
+	return out
+}
+
+// runQuestions drafts an eval set from what people actually asked.
+func runQuestions(argv []string) {
+	fs := flag.NewFlagSet("questions", flag.ExitOnError)
+	model := fs.String("model", "models/meridian.yaml", "semantic model YAML")
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	out := fs.String("out", "", "write the draft here (default: stdout)")
+	limit := fs.Int("limit", 40, "how many cases to propose")
+	engFile := fs.String("engagement", "", "take model and dsn from an engagement.yaml")
+	dbID := fs.String("db", "", "which database in the engagement")
+	_ = fs.Parse(argv)
+
+	customer := ""
+	if name, m, ds, _, _, _, ok := fromEngagement(*engFile, *dbID); ok {
+		model, dsn, customer = &m, &ds, name
+	}
+	ctx := context.Background()
+	eng, err := engine.New(ctx, *model, *dsn)
+	if err != nil {
+		fail(err)
+	}
+	defer eng.Close()
+
+	mined, err := nleval.MineQuestions(ctx, eng, customer, *limit)
+	if err != nil {
+		fail(err)
+	}
+	if len(mined) == 0 {
+		fmt.Fprintln(os.Stderr, "-- no questions in the audit trail yet; ask some through the product first")
+		os.Exit(1)
+	}
+	body := nleval.RenderMined(customer, mined)
+	if *out == "" {
+		fmt.Print(body)
+	} else if err := os.WriteFile(*out, []byte(body), 0o644); err != nil {
+		fail(err)
+	} else {
+		fmt.Fprintf(os.Stderr, "-- wrote %s: %d proposed case(s) — read them before promoting any\n", *out, len(mined))
+	}
+}
+
+// runAnchor turns a number the customer already publishes into a reconciliation
+// case.
+//
+// Without it every control query is written by the same person who wrote the
+// metric, and the delivery report can only ever say SELF-CONSISTENT. This is
+// the command that lets it say VERIFIED, and it is the reason the whole
+// reconciliation section is worth reading.
+func runAnchor(argv []string) {
+	fs := flag.NewFlagSet("anchor", flag.ExitOnError)
+	model := fs.String("model", "models/meridian.yaml", "semantic model YAML")
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	metric := fs.String("metric", "", "the metric the published figure is meant to be")
+	value := fs.String("value", "", "the figure the customer publishes, written as they write it (97.3 declares ±0.05)")
+	note := fs.String("note", "", "where the figure came from — page, report, date")
+	source := fs.String("source", nleval.SourceCustomerReport, "customer-report | customer-system")
+	tol := fs.Float64("tol", 0, "absolute tolerance (default: read off the figure's own precision)")
+	pick := fs.Int("pick", 0, "when several scopes match, choose one by number — the engineer decides, the case records it")
+	write := fs.Bool("write", false, "append the case to the reconciliation set")
+	recon := fs.String("recon", "", "reconciliation set (default: <model>.recon.yaml)")
+	engFile := fs.String("engagement", "", "take model and dsn from an engagement.yaml")
+	dbID := fs.String("db", "", "which database in the engagement")
+	_ = fs.Parse(argv)
+
+	if _, m, ds, r, _, _, ok := fromEngagement(*engFile, *dbID); ok {
+		model, dsn = &m, &ds
+		if *recon == "" && r != "" {
+			recon = &r
+		}
+	}
+	if *metric == "" || *value == "" {
+		fail(fmt.Errorf("anchor needs -metric and -value: the figure the customer publishes, and which metric it is meant to be"))
+	}
+	target, perr := strconv.ParseFloat(strings.TrimSpace(*value), 64)
+	if perr != nil {
+		fail(fmt.Errorf("-value %q is not a number", *value))
+	}
+	if *tol <= 0 {
+		*tol = anchor.ToleranceOf(*value)
+	}
+	if *recon == "" {
+		*recon = nleval.ReconPathFor(*model)
+	}
+
+	ctx := context.Background()
+	eng, err := engine.New(ctx, *model, *dsn)
+	if err != nil {
+		fail(err)
+	}
+	defer eng.Close()
+
+	res, err := anchor.Search(ctx, eng, *metric, target, anchor.Options{Tol: *tol})
+	if err != nil {
+		fail(err)
+	}
+
+	fmt.Printf("-- searched %d scope(s) in %d queries, tolerance ±%g\n", res.Searched, res.Queries, *tol)
+	for _, s := range res.Skipped {
+		fmt.Fprintf(os.Stderr, "-- not searched: %s\n", s)
+	}
+	for {
+		switch {
+		case len(res.Matches) == 0:
+			fmt.Printf("\nNo scope of %s produces %s.\n", *metric, *value)
+			if res.Closest != nil {
+				fmt.Printf("Closest: %s = %s (%s)\n", *metric, nleval.Num(res.Closest.Value), res.Closest.Label)
+			}
+			fmt.Println("\nThat is a finding, not a failure: either the figure is scoped by something")
+			fmt.Println("the model cannot express yet, or it is a different metric than we assumed.")
+			fmt.Println("Ask which, and what it excludes.")
+			os.Exit(1)
+		case res.TooCoarse():
+			// Everything matching is the failure that looks most like success.
+			fmt.Printf("\n%s cannot anchor anything: every scope of %s lands between %s and %s,\n",
+				*value, *metric, nleval.Num(res.Lo), nleval.Num(res.Hi))
+			fmt.Printf("and ±%g cannot tell them apart. %d scope(s) match.\n\n", *tol, len(res.Matches))
+			fmt.Println("This is a finding about the figure, not about the model. Ask for more")
+			fmt.Println("decimal places, or anchor on a metric that actually moves between plants")
+			fmt.Println("and quarters — a number everyone agrees on proves nothing about scope.")
+			os.Exit(1)
+		case len(res.Matches) > 1:
+			// Several scopes producing the same number is not an anchor. Picking
+			// one and writing it down would manufacture a verification out of a
+			// coincidence, and the report would then say VERIFIED on the strength
+			// of it.
+			if *pick >= 1 && *pick <= len(res.Matches) {
+				// A human chose. That is the only thing that can resolve this — the
+				// figure genuinely does not distinguish these scopes — and the note
+				// records who decided and on what basis.
+				res.Matches = res.Matches[*pick-1 : *pick]
+				break
+			}
+			fmt.Printf("\n%d scopes produce %s — that is ambiguous, not anchored:\n\n", len(res.Matches), *value)
+			for i, m := range res.Matches {
+				fmt.Printf("  [%d] %s\n", i+1, m.Label)
+			}
+			fmt.Println("\nAsk the customer which one their figure covers, then re-run with")
+			fmt.Println("-pick N. The choice is a business decision, so it is recorded as one.")
+			os.Exit(1)
+		}
+		break
+	}
+
+	m := res.Matches[0]
+	if res.Scale != 0 && res.Scale != 1 {
+		// The number was right and the units were not. Recording the converted
+		// value silently would hide the mismatch, and the next figure from the
+		// same report would hit it again.
+		fmt.Printf("\n%s is %s in the customer's units — the metric is %s, a factor of %g apart.\n",
+			*value, *metric, nleval.Num(m.Value), res.Scale)
+		fmt.Println("Confirm the unit with them before this becomes evidence.")
+		// Convert their figure into the metric's units — do NOT replace it with
+		// what we computed. Storing our own number and calling it the
+		// customer's is exactly the circularity this command exists to break.
+		target *= res.Scale
+		*tol *= math.Abs(res.Scale)
+	}
+	fmt.Printf("\n%s = %s over %s\n", *metric, nleval.Num(m.Value), m.Label)
+	// The tolerance travels with the case: the customer published three
+	// decimals, so three decimals is what this can ever prove. Left at the
+	// default 1e-6 the case fails forever against a metric that agrees with it
+	// to every digit they actually have.
+	c := nleval.ReconCase{Metric: *metric, Value: &target, Where: m.Where,
+		Source: *source, Note: *note, Tol: *tol}
+	if !*write {
+		fmt.Println("\nAdd this to " + *recon + " (or re-run with -write):")
+		fmt.Print("\n" + nleval.RenderCase(c))
+		return
+	}
+	if err := nleval.AppendCase(*recon, c); err != nil {
+		fail(err)
+	}
+	fmt.Fprintf(os.Stderr, "-- appended to %s\n", *recon)
+}
+
+func runReport(argv []string) {
+	fs := flag.NewFlagSet("report", flag.ExitOnError)
+	model := fs.String("model", "models/meridian.yaml", "semantic model YAML")
+	dsn := fs.String("dsn", envOr("DI_DSN", defaultDSN), "warehouse DSN")
+	recon := fs.String("recon", "", "reconciliation set (default: <model>.recon.yaml)")
+	set := fs.String("set", "models/nl_evalset.yaml", "labeled NL eval set (skipped if absent)")
+	database := fs.String("database", "", "customer/database name for the heading")
+	out := fs.String("out", "", "write markdown here (default: stdout)")
+	jsonOut := fs.String("json", "", "also write the machine-readable report here")
+	engFile := fs.String("engagement", "", "take everything from an engagement.yaml")
+	dbID := fs.String("db", "", "which database in the engagement")
+	_ = fs.Parse(argv)
+
+	if name, m, ds, r, es, ro, ok := fromEngagement(*engFile, *dbID); ok {
+		if m == "" {
+			fail(fmt.Errorf("database %q has no semantic model yet — run `di survey`, then generate one", *dbID))
+		}
+		model, dsn, recon = &m, &ds, &r
+		if *database == "" {
+			database = &name
+		}
+		// An engagement with no `evalset:` has no evalset — it does not fall
+		// back to the platform's own. The default is a path relative to the
+		// working directory, and run from this repo it resolves to the retail
+		// demo set, which put "what is total revenue" and thirty-six wrong
+		// answers about store regions into a foundry's acceptance report. A
+		// delivery document containing another customer's questions is worse
+		// than one with no accuracy section at all.
+		set = &es
+		if *out == "" && ro != "" {
+			out = &ro
+		}
+	}
+
+	ctx := context.Background()
+	d := &nleval.Delivery{Database: *database, Model: *model}
+
+	// Reconciliation is the load-bearing half. Without it the report says so
+	// rather than printing a shape and letting it read as verification.
+	rep, eng, err := reconcileModel(ctx, *model, *dsn, *recon)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "-- reconciliation unavailable: %v\n", err)
+		eng, err = engine.New(ctx, *model, *dsn)
+		if err != nil {
+			fail(err)
+		}
+	} else {
+		d.Recon = rep
+		d.Uncovered = rep.Uncovered(eng.Model)
+	}
+	defer eng.Close()
+	d.Describe(eng.Model)
+
+	for _, is := range semantic.Lint(eng.Model) {
+		d.Notes = append(d.Notes, is.String())
+	}
+
+	// NL accuracy is optional: a delivery without a labelled set is still a
+	// delivery, and an empty accuracy section is more honest than a fabricated one.
+	ds, lerr := nleval.Load(*set)
+	if lerr == nil {
+		dir, _ := os.MkdirTemp("", "di-report-")
+		defer os.RemoveAll(dir)
+		if g, gerr := grounding.New(ctx, eng.Model, filepath.Join(dir, "idx.db")); gerr == nil {
+			defer g.Close()
+			if bank, berr := grounding.LoadExemplars(ctx, "models/exemplars.yaml"); berr == nil {
+				g.WithExemplars(bank)
+			}
+			grader := &nleval.Grader{Eng: eng, Gr: g, Pol: governance.DefaultPolicy()}
+			d.NL = grader.Run(ctx, ds, strings.Contains(g.Mode(), "llm"))
+		}
+	} else if *set == "" {
+		fmt.Fprintln(os.Stderr, "-- no evalset declared; accuracy section omitted")
+	} else if errors.Is(lerr, iofs.ErrNotExist) {
+		fmt.Fprintf(os.Stderr, "-- no NL eval set at %s; accuracy section omitted\n", *set)
+	} else {
+		// A declared evalset that will not parse is a mistake, not an absence.
+		// Reported as "no eval set" it reads identically to not having one, and
+		// the delivery goes out with the accuracy section quietly missing —
+		// which is how a typo (`expect:` for `expect_metrics:`) turned into an
+		// acceptance report that said nothing about accuracy at all.
+		fail(fmt.Errorf("evalset %w", lerr))
+	}
+
+	var buf strings.Builder
+	d.WriteMarkdown(&buf)
+	if *out == "" {
+		fmt.Print(buf.String())
+	} else if err := os.WriteFile(*out, []byte(buf.String()), 0o644); err != nil {
+		fail(err)
+	} else {
+		fmt.Fprintf(os.Stderr, "-- wrote %s\n", *out)
+	}
+	if *jsonOut != "" {
+		b, _ := json.MarshalIndent(d, "", "  ")
+		if err := os.WriteFile(*jsonOut, b, 0o644); err != nil {
+			fail(err)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "-- %s\n", d.Verdict())
+}
+
+// fromEngagement resolves a database inside an engagement to the paths and DSN
+// the model-facing commands need.
+//
+// Without it every command needs -model -dsn -recon -set spelled out, and a
+// delivery is reproducible only by whoever remembers the flags. With it the
+// engagement file is the reproduction.
+func fromEngagement(engPath, dbID string) (name, model, dsn, recon, evalset, reportOut string, ok bool) {
+	path, err := engagement.Find(engPath)
+	if err != nil {
+		return "", "", "", "", "", "", false
+	}
+	e, err := engagement.Load(path)
+	if err != nil {
+		fail(err)
+	}
+	d, err := e.Database(dbID)
+	if err != nil {
+		fail(err)
+	}
+	return fmt.Sprintf("%s · %s", e.Customer, d.ID), d.Model, d.DSN, d.Recon, e.Evalset, e.Deliver.Report, true
+}
+
+// runSurvey is week one of an engagement: find out what is actually in the
+// customer's database, by looking rather than by asking.
+//
+// The schema diagram is out of date, one feed stopped six months ago, and a
+// third of the foreign keys point at rows that do not exist. None of that shows
+// up in a schema dump, and all of it decides what can be modelled.
+// engineerLLM resolves the model behind a command an engineer runs by hand.
+//
+// A coding-agent CLI first, when one is asked for: it is already installed and
+// already authenticated, and these calls happen once, on a laptop, where three
+// seconds of process startup costs nothing. Otherwise the ordinary API path.
+//
+// This deliberately has no caller in `di serve`. See the aicli package comment
+// for why — latency, concurrency, and the fact that a personal Claude Code or
+// Codex subscription is not a licence to be the inference backend of software
+// somebody bought.
+func engineerLLM() (aicli.Ask, string, bool) {
+	if r, ok := aicli.FromEnv(); ok {
+		return r.Ask(), r.Name, true
+	}
+	if svc, err := llm.NewOpenAIFromEnv(); err == nil {
+		return svc.Ask, "LLM", true
+	}
+	fmt.Fprintln(os.Stderr, "-- no model configured: set DI_AGENT_CLI=claude|codex, or LLM_BASE_URL/LLM_API_KEY/LLM_MODEL")
+	return nil, "", false
+}
+
+func runSurvey(argv []string) {
+	fs := flag.NewFlagSet("survey", flag.ExitOnError)
+	eng := fs.String("engagement", "", "engagement.yaml (default: nearest one)")
+	db := fs.String("database", "", "which database in the engagement (default: the first)")
+	dsn := fs.String("dsn", "", "survey this DSN directly, ignoring any engagement")
+	out := fs.String("out", "", "write markdown here (default: stdout)")
+	jsonOut := fs.String("json", "", "also write the machine-readable survey here")
+	stale := fs.Duration("stale-after", 60*24*time.Hour, "flag a time column whose newest value is older than this")
+	maxDistinct := fs.Int64("max-distinct", 50, "cap the distinct-value probe per column")
+	skipFK := fs.Bool("skip-orphans", false, "skip referential-integrity probes (the costliest part)")
+	sampleAbove := fs.Int64("sample-above", survey.DefaultSampleAbove, "profile distinct values from a sample above this row count (0 = never)")
+	sampleRows := fs.Int64("sample-rows", 200_000, "roughly how many rows a sample reads")
+	_ = fs.Parse(argv)
+
+	ctx := context.Background()
+	name, target := "", *dsn
+	if target == "" {
+		path, err := engagement.Find(*eng)
+		if err != nil {
+			fail(err)
+		}
+		e, err := engagement.Load(path)
+		if err != nil {
+			fail(err)
+		}
+		d, err := e.Database(*db)
+		if err != nil {
+			fail(err)
+		}
+		name, target = fmt.Sprintf("%s · %s", e.Customer, d.ID), d.DSN
+	}
+
+	// Surveying opens the warehouse without a model on purpose: at this point
+	// nobody has written one, and needing a model to look around would make the
+	// first useful step impossible.
+	wh, err := warehouse.Open(ctx, target, warehouse.Options{MaxRows: 1000})
+	if err != nil {
+		fail(err)
+	}
+	defer wh.Close()
+
+	// A survey reads distinct values and samples rows: the customer's data,
+	// in the clear, before a model exists to govern it. It needs the same
+	// signature `model gen` does.
+	plan := requireIntake(ctx, wh, target)
+	fmt.Fprintf(os.Stderr, "-- intake plan %s, signed by %s\n", plan.Short(), plan.SignedBy)
+
+	rep, err := survey.Run(ctx, wh, name, survey.Options{
+		MaxDistinct: *maxDistinct, StaleAfter: *stale, SkipOrphans: *skipFK,
+		SampleAbove: *sampleAbove, SampleRows: *sampleRows,
+	})
+	if err != nil {
+		fail(err)
+	}
+
+	var buf strings.Builder
+	rep.WriteMarkdown(&buf)
+	if *out == "" {
+		fmt.Print(buf.String())
+	} else if err := os.WriteFile(*out, []byte(buf.String()), 0o644); err != nil {
+		fail(err)
+	} else {
+		fmt.Fprintf(os.Stderr, "-- wrote %s\n", *out)
+	}
+	if *jsonOut != "" {
+		b, _ := json.MarshalIndent(rep, "", "  ")
+		if err := os.WriteFile(*jsonOut, b, 0o644); err != nil {
+			fail(err)
+		}
+	}
+	for _, f := range rep.Findings {
+		fmt.Fprintf(os.Stderr, "-- %s\n", f)
+	}
+}
+
+// runDrift is the Day 2 check: has anything changed underneath the model.
+//
+// The three failures it looks for all produce clean-looking wrong answers
+// rather than errors, which is why they need a command rather than a log.
+func runDrift(argv []string) {
+	fs := flag.NewFlagSet("drift", flag.ExitOnError)
+	engFile := fs.String("engagement", "", "engagement.yaml (default: nearest one)")
+	dbID := fs.String("database", "", "which database in the engagement")
+	model := fs.String("model", "", "semantic model YAML (instead of an engagement)")
+	dsn := fs.String("dsn", "", "warehouse DSN (instead of an engagement)")
+	stale := fs.Duration("stale-after", 30*24*time.Hour, "flag a time dimension whose newest row is older than this")
+	_ = fs.Parse(argv)
+
+	name, m, d, r := "", *model, *dsn, ""
+	if m == "" || d == "" {
+		if n, em, ed, er, _, _, ok := fromEngagement(*engFile, *dbID); ok {
+			name, m, d, r = n, em, ed, er
+		}
+	}
+	m, d = fromEnvIfUnset(m, d)
+	if m == "" {
+		fail(fmt.Errorf("drift needs a modelled database — an unmodelled one has nothing to drift from"))
+	}
+
+	ctx := context.Background()
+	eng, err := engine.New(ctx, m, d)
+	if err != nil {
+		fail(err)
+	}
+	defer eng.Close()
+
+	var set *nleval.ReconSet
+	if r == "" {
+		r = nleval.ReconPathFor(m)
+	}
+	if s, serr := nleval.LoadReconSet(r); serr == nil {
+		set = s
+	}
+
+	drift, err := handover.Check(ctx, eng, set, *stale)
+	if err != nil {
+		fail(err)
+	}
+	drift.Database = name
+	drift.WriteText(os.Stdout)
+	if !drift.Clean() {
+		os.Exit(1) // usable as a scheduled job or a CI step
+	}
+}
+
+// runHandover writes what the customer's team is left holding.
+func runHandover(argv []string) {
+	fs := flag.NewFlagSet("handover", flag.ExitOnError)
+	engFile := fs.String("engagement", "", "engagement.yaml (default: nearest one)")
+	out := fs.String("out", "", "write the runbook here (default: <engagement dir>/RUNBOOK.md)")
+	workflow := fs.String("workflow", "", "write the CI gate here (default: <engagement dir>/.github/workflows/di-gate.yml)")
+	core := fs.String("core", "", "where the service runs, for the runbook")
+	_ = fs.Parse(argv)
+
+	path, err := engagement.Find(*engFile)
+	if err != nil {
+		fail(err)
+	}
+	e, err := engagement.Load(path)
+	if err != nil {
+		fail(err)
+	}
+	rb := &handover.Runbook{E: e, CoreAddr: *core}
+
+	if *out == "" {
+		*out = filepath.Join(e.Dir(), "RUNBOOK.md")
+	}
+	var buf strings.Builder
+	rb.WriteMarkdown(&buf)
+	if err := os.WriteFile(*out, []byte(buf.String()), 0o644); err != nil {
+		fail(err)
+	}
+	fmt.Fprintf(os.Stderr, "-- wrote %s\n", *out)
+
+	if *workflow == "" {
+		*workflow = filepath.Join(e.Dir(), ".github", "workflows", "di-gate.yml")
+	}
+	if err := os.MkdirAll(filepath.Dir(*workflow), 0o755); err != nil {
+		fail(err)
+	}
+	if err := os.WriteFile(*workflow, []byte(rb.WorkflowYAML()), 0o644); err != nil {
+		fail(err)
+	}
+	fmt.Fprintf(os.Stderr, "-- wrote %s\n", *workflow)
+
+	modelled, total := e.Modelled()
+	if modelled < total {
+		fmt.Fprintf(os.Stderr, "-- %d of %d database(s) are still unmodelled; the runbook says so\n", total-modelled, total)
+	}
+}
+
+// fromEnvIfUnset fills what neither the flags nor an engagement supplied from
+// DI_DSN and DI_MODEL, which every other command reads.
+//
+// drift and adoption resolved only from flags or an engagement, so with
+// DI_DSN exported and no engagement.yaml nearby they handed an empty DSN to
+// the driver — which read it as "the local socket, as the current user" and
+// failed with `failed to connect to user=liliang database=`, an error about a
+// database nobody asked for.
+func fromEnvIfUnset(model, dsn string) (string, string) {
+	if dsn == "" {
+		dsn = os.Getenv("DI_DSN")
+	}
+	if model == "" {
+		model = os.Getenv("DI_MODEL")
+	}
+	if dsn == "" {
+		fail(fmt.Errorf("no database to read: pass -dsn, set DI_DSN, or run from an engagement directory"))
+	}
+	return model, dsn
+}
+
+// runAdoption reads the audit trail back: who used this, and what nobody asked for.
+func runAdoption(argv []string) {
+	fs := flag.NewFlagSet("adoption", flag.ExitOnError)
+	engFile := fs.String("engagement", "", "engagement.yaml (default: nearest one)")
+	dbID := fs.String("database", "", "which database in the engagement")
+	model := fs.String("model", "", "semantic model YAML (instead of an engagement)")
+	dsn := fs.String("dsn", "", "warehouse DSN (instead of an engagement)")
+	days := fs.Int("days", 30, "window to report on")
+	out := fs.String("out", "", "write markdown here (default: stdout)")
+	_ = fs.Parse(argv)
+
+	name, m, d := "", *model, *dsn
+	if d == "" {
+		if n, em, ed, _, _, _, ok := fromEngagement(*engFile, *dbID); ok {
+			name, m, d = n, em, ed
+		}
+	}
+	m, d = fromEnvIfUnset(m, d)
+	ctx := context.Background()
+	eng, err := engine.New(ctx, m, d)
+	if err != nil {
+		fail(err)
+	}
+	defer eng.Close()
+
+	a, err := handover.Measure(ctx, eng, name, name, *days)
+	if err != nil {
+		fail(err)
+	}
+	var buf strings.Builder
+	a.WriteMarkdown(&buf)
+
+	// Adoption says how much was asked; provenance says how much of it anybody
+	// stands behind. Reported together because separately each one flatters the
+	// delivery: a busy trail reads as success until you ask whose definitions
+	// produced it.
+	prov, perr := handover.Attest(ctx, eng, name, name)
+	if perr == nil {
+		buf.WriteString("\n")
+		prov.WriteMarkdown(&buf)
+	}
+
+	if *out == "" {
+		fmt.Print(buf.String())
+	} else if err := os.WriteFile(*out, []byte(buf.String()), 0o644); err != nil {
+		fail(err)
+	}
+	fmt.Fprintf(os.Stderr, "-- %s\n", a.Summary())
+	if perr == nil {
+		fmt.Fprintf(os.Stderr, "-- %s\n", prov.Summary())
+	}
+}
+
+// runDelta rolls up what the product could not do, across every engagement.
+//
+// This is the loop that separates a forward-deployed engineer from a
+// consultant, and it only works if somebody reads it: a gap recorded once in a
+// customer's repository and never counted is the same as not having recorded it.
+func runDelta(argv []string) {
+	fs := flag.NewFlagSet("delta", flag.ExitOnError)
+	root := fs.String("root", ".", "directory to scan for engagement.yaml files")
+	out := fs.String("out", "", "write markdown here (default: stdout)")
+	jsonOut := fs.String("json", "", "also write the machine-readable rollup here")
+	_ = fs.Parse(argv)
+
+	paths, err := handover.FindEngagements(*root)
+	if err != nil {
+		fail(err)
+	}
+	var loaded []*engagement.Engagement
+	for _, p := range paths {
+		e, lerr := engagement.LoadRecord(p)
+		if lerr != nil {
+			// One unreadable engagement must not hide the gaps recorded in the
+			// other nineteen.
+			fmt.Fprintf(os.Stderr, "-- skipped %s: %v\n", p, lerr)
+			continue
+		}
+		loaded = append(loaded, e)
+	}
+	if len(loaded) == 0 {
+		if len(paths) > 0 {
+			fail(fmt.Errorf("found %d engagement.yaml under %s and could read none of them (see above)", len(paths), *root))
+		}
+		fail(fmt.Errorf("no engagement.yaml found under %s", *root))
+	}
+
+	r := handover.Rollup(loaded)
+	var buf strings.Builder
+	r.WriteMarkdown(&buf)
+	if *out == "" {
+		fmt.Print(buf.String())
+	} else if err := os.WriteFile(*out, []byte(buf.String()), 0o644); err != nil {
+		fail(err)
+	}
+	if *jsonOut != "" {
+		b, _ := json.MarshalIndent(r, "", "  ")
+		if err := os.WriteFile(*jsonOut, b, 0o644); err != nil {
+			fail(err)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "-- %s\n", r.Summary())
+}
